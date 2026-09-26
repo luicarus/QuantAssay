@@ -1,0 +1,38 @@
+# Line endings: normalise to LF in the repository.
+#
+# This project is explicit about LF: a CRLF shell script fails under bash with a
+# misleading error (`pipefail: invalid option name`), and the WSL execution layer
+# is where every real run happens. Without this file, Git on Windows would store
+# CRLF and break those scripts for anyone who clones on Linux.
+#
+# `text=auto` still lets Git detect binary files and leave them alone.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending-translated.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.safetensors binary
+*.bin binary
+*.pt binary
+*.pyc binary
+
+# Explicit LF for files where it is functionally required.
+*.sh text eol=lf
+*.bash text eol=lf
+Dockerfile text eol=lf
+Makefile text eol=lf
+
+# Windows-only helper scripts would want CRLF, but this repo has none committed
+# (execution helpers live in the gitignored .scripts/).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Generated or vendored trees: keep Git from trying to diff them as text.
+*.lock -diff

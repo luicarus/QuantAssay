@@ -1,0 +1,53 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pytest-tmp/
+.scan_tmp/
+
+# Build artifacts. `build/` holds a full copy of src/, so leaving it unignored
+# would commit a duplicated source tree that silently drifts from the real one.
+build/
+dist/
+*.egg-info/
+
+# Local virtual environments and experiment outputs
+.venv/
+runs/
+
+# ---------------------------------------------------------------------------
+# Documentation: opt-in, not opt-out.
+#
+# Only the user-facing documents ship: README.md and docs/guide.md. Everything
+# else under docs/ and examples/ is working material — it carries this machine's
+# absolute paths, measured-once numbers, failure narratives and internal
+# planning, none of which belongs in a public repository.
+#
+# Ignoring the whole directory and then re-including the one public file is
+# deliberate: a *new* internal doc is then private by default. An allowlist
+# cannot leak something that was never published on purpose, whereas a denylist
+# silently publishes every file someone forgets to add.
+#
+# requirements/ is NOT ignored: it holds the pinned dependency set that the
+# README's install command needs (`pip install -r requirements/...`).
+# ---------------------------------------------------------------------------
+docs/*
+!docs/guide.md
+# examples/ is entirely local, including RUNBOOK.md (a reproducibility checklist
+# for this machine, not user documentation).
+examples/
+
+# Durable conclusions live in docs/guide.md; the working notes stay local.
+docs/engineering-notes.md
+
+# AGENTS.md is instructions to the repository's AI coding agents and maintainer:
+# personal working habits, machine-specific paths (venv names, model cache with a
+# pinned revision, local run directories) and links to the other local docs
+# above. Public readers would get dead links and someone's private setup notes.
+# Contributor-facing conventions, if ever published, belong in CONTRIBUTING.md.
+AGENTS.md
+
+# Installation and execution logs
+*.log
+.scripts/

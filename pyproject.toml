@@ -1,0 +1,39 @@
+[build-system]
+# 77.0.0 is the first release with PEP 639 support: the SPDX `license` string
+# below is only valid under it, so the floor is raised deliberately.
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantassay"
+version = "0.1.0.dev0"
+description = "SGLang quantization serving regression analyzer"
+requires-python = ">=3.12"
+# PEP 639 SPDX expression. The full text is in LICENSE; no copyright holder is
+# named here because that is the project owner's decision, not a build detail.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+# Keep the base install light so CPU contracts run anywhere; the GPU stack
+# (sglang/torch/llmcompressor/vllm) lives only in the WSL execution venv and is
+# pinned in requirements/execution-layer.txt.
+dependencies = [
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --basetemp=.pytest-tmp"
+pythonpath = ["src"]
+markers = [
+    "gpu: requires a real GPU and real quantization artifacts; never counts as passed via a simulated backend",
+]
