@@ -465,6 +465,35 @@ def test_bf16_command_defaults_to_triton_attention_backend(tmp_path: Path) -> No
     assert command[command.index("--max-running-requests") + 1] == "1"
 
 
+@pytest.mark.parametrize("backend", ["torch", "triton"])
+def test_bf16_command_uses_versioned_kernscope_adapter(tmp_path: Path, backend: str) -> None:
+    command = build_bf16_command(
+        tmp_path,
+        30000,
+        0.8,
+        operator_backend=backend,
+        sglang_version="0.5.3",
+    )
+    assert command[:3] == [
+        sys.executable,
+        "-m",
+        "quantassay.integrations.sglang.v0_5_3",
+    ]
+    assert command[3:5] == ["--kernscope-backend", backend]
+    assert command[command.index("--attention-backend") + 1] == gating.DEFAULT_ATTENTION_BACKEND
+
+
+def test_kernscope_adapter_rejects_other_sglang_versions(tmp_path: Path) -> None:
+    with pytest.raises(ProbeError, match="requires SGLang 0.5.3"):
+        build_bf16_command(
+            tmp_path,
+            30000,
+            0.8,
+            operator_backend="triton",
+            sglang_version="0.5.20",
+        )
+
+
 def test_bf16_command_rejects_unknown_backend(tmp_path: Path) -> None:
     with pytest.raises(ProbeError, match="attention backend"):
         build_bf16_command(tmp_path, 30000, 0.8, attention_backend="nope")
@@ -521,6 +550,16 @@ def test_fingerprint_changes_with_attention_backend(tmp_path: Path) -> None:
     assert base == gating._fingerprint(
         snapshot, "a" * 40, 30000, 0.8, attention_backend="triton"
     )
+
+
+def test_fingerprint_changes_with_operator_backend(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snap"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+    builtin = gating._fingerprint(snapshot, "a" * 40, 30000, 0.8, operator_backend="sglang")
+    triton = gating._fingerprint(snapshot, "a" * 40, 30000, 0.8, operator_backend="triton")
+    assert builtin != triton
 
 
 def test_checkpoint_manifest_detects_tampering(tmp_path: Path) -> None:

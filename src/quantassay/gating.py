@@ -68,6 +68,8 @@ KNOWN_ATTENTION_BACKENDS = (
     "flashmla",
     "cutlass_mla",
 )
+DEFAULT_OPERATOR_BACKEND = "sglang"
+KNOWN_OPERATOR_BACKENDS = ("sglang", "torch", "triton")
 
 # Cap the prefill CUDA graph's largest captured batch size. SGLang captures one
 # graph per bucket (up to ~30 by default); with max-running-requests=1 the big
@@ -800,6 +802,7 @@ def serving_parameters(args: Any) -> dict[str, Any]:
     """The serving configuration the two sides must share exactly."""
     return {
         "attention_backend": args.attention_backend,
+        "operator_backend": args.operator_backend,
         "mem_fraction_static": args.mem_fraction_static,
         "cuda_graph_max_bs": args.cuda_graph_max_bs,
         "disable_cuda_graph": bool(args.disable_cuda_graph),
@@ -1052,6 +1055,7 @@ def _quality_operation(
                 args.port,
                 args.mem_fraction_static,
                 attention_backend=args.attention_backend,
+                operator_backend=args.operator_backend,
                 cuda_graph_max_bs=args.cuda_graph_max_bs,
                 sglang_version=_package_version("sglang"),
                 disable_cuda_graph=args.disable_cuda_graph,
@@ -1666,14 +1670,15 @@ def _fingerprint(
     attention_backend: str = DEFAULT_ATTENTION_BACKEND,
     cuda_graph_max_bs: int = DEFAULT_CUDA_GRAPH_MAX_BS,
     quant_method: str = "gptq",
+    operator_backend: str = DEFAULT_OPERATOR_BACKEND,
 ) -> str:
     """Bind a run to its model content, serving configuration and method.
 
     The snapshot hashes are included because the same revision string can sit
     next to modified or partially downloaded weights; without them a resume
     could silently reuse stages produced from different files. The attention
-    backend and CUDA-graph cap change the execution path and memory profile,
-    so they belong in the identity too.
+    backend, RMSNorm operator backend, and CUDA-graph cap change the
+    execution path and memory profile, so they belong in the identity too.
 
     ``quant_method`` is part of the identity because one run directory holds one
     method's evidence: switching method in place would overwrite the previous
@@ -1688,6 +1693,7 @@ def _fingerprint(
         "port": port,
         "mem_fraction_static": mem_fraction,
         "attention_backend": attention_backend,
+        "operator_backend": operator_backend,
         "cuda_graph_max_bs": cuda_graph_max_bs,
         "quant_method": quant_method,
         "torch": _package_version("torch"),
@@ -1715,6 +1721,7 @@ def build_bf16_command(
     mem_fraction: float,
     *,
     attention_backend: str = DEFAULT_ATTENTION_BACKEND,
+    operator_backend: str = DEFAULT_OPERATOR_BACKEND,
     cuda_graph_max_bs: int = DEFAULT_CUDA_GRAPH_MAX_BS,
     sglang_version: str | None = None,
     disable_cuda_graph: bool = False,
@@ -1726,12 +1733,29 @@ def build_bf16_command(
             f"unknown attention backend {attention_backend!r}; "
             f"known: {sorted(KNOWN_ATTENTION_BACKENDS)}"
         )
+    if operator_backend not in KNOWN_OPERATOR_BACKENDS:
+        raise ProbeError(
+            f"unknown operator backend {operator_backend!r}; "
+            f"known: {sorted(KNOWN_OPERATOR_BACKENDS)}"
+        )
+    if operator_backend != "sglang" and sglang_version is not None:
+        if _sglang_version_tuple(sglang_version) != (0, 5, 3):
+            raise ProbeError("QuantAssay's Kernscope adapter requires SGLang 0.5.3")
     if not 1 <= cuda_graph_max_bs <= 8:
         raise ProbeError("cuda-graph-max-bs must be between 1 and 8")
+    module = (
+        "sglang.launch_server"
+        if operator_backend == "sglang"
+        else "quantassay.integrations.sglang.v0_5_3"
+    )
     command = [
         sys.executable,
         "-m",
-        "sglang.launch_server",
+        module,
+    ]
+    if operator_backend != "sglang":
+        command += ["--kernscope-backend", operator_backend]
+    command += [
         "--model-path",
         str(model_dir.resolve()),
         "--served-model-name",
@@ -1932,6 +1956,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--operator-backend",
+        choices=KNOWN_OPERATOR_BACKENDS,
+        default=DEFAULT_OPERATOR_BACKEND,
+        help=(
+            "RMSNorm backend: SGLang's built-in kernels, Kernscope PyTorch, or "
+            "Kernscope Triton (requires the Kernscope package in this environment)"
+        ),
+    )
+    parser.add_argument(
         "--cuda-graph-max-bs",
         type=int,
         default=DEFAULT_CUDA_GRAPH_MAX_BS,
@@ -1960,6 +1993,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ProbeError("revision must be a 40-character commit SHA")
         if args.quant_timeout_minutes <= 0:
             raise ProbeError("quant-timeout-minutes must be positive")
+        if args.operator_backend != "sglang":
+            if _package_version("sglang") != "0.5.3":
+                raise ProbeError("QuantAssay's Kernscope adapter requires SGLang 0.5.3")
+            import_command = [
+                sys.executable,
+                "-c",
+                "import quantassay.integrations.sglang.v0_5_3",
+            ]
+            if args.operator_backend == "triton":
+                import_command[2] += "; import triton"
+            adapter_check = _cpu_check(import_command, timeout=15)
+            if not adapter_check["ok"]:
+                raise ProbeError("Kernscope adapter is unavailable: " + adapter_check["output"])
         journal = StageJournal(
             args.run_dir,
             fingerprint=_fingerprint(
@@ -1968,6 +2014,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.port,
                 args.mem_fraction_static,
                 attention_backend=args.attention_backend,
+                operator_backend=args.operator_backend,
                 cuda_graph_max_bs=args.cuda_graph_max_bs,
                 quant_method=args.quant_method,
             ),
@@ -2003,6 +2050,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.port,
                         args.mem_fraction_static,
                         attention_backend=args.attention_backend,
+                        operator_backend=args.operator_backend,
                         cuda_graph_max_bs=args.cuda_graph_max_bs,
                         sglang_version=_package_version("sglang"),
                     ),
@@ -2115,6 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.port,
                             args.mem_fraction_static,
                             attention_backend=args.attention_backend,
+                            operator_backend=args.operator_backend,
                             cuda_graph_max_bs=args.cuda_graph_max_bs,
                             sglang_version=_package_version("sglang"),
                             disable_cuda_graph=args.disable_cuda_graph,
@@ -2180,6 +2229,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.port,
                             args.mem_fraction_static,
                             attention_backend=args.attention_backend,
+                            operator_backend=args.operator_backend,
                             cuda_graph_max_bs=args.cuda_graph_max_bs,
                             sglang_version=_package_version("sglang"),
                         ),
@@ -2238,6 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.port,
                             args.mem_fraction_static,
                             attention_backend=args.attention_backend,
+                            operator_backend=args.operator_backend,
                             cuda_graph_max_bs=args.cuda_graph_max_bs,
                             sglang_version=_package_version("sglang"),
                             disable_cuda_graph=args.disable_cuda_graph,

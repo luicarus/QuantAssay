@@ -86,7 +86,7 @@ print(p)
 ```bash
 export PYTHONPATH=src
 
-RUN=runs/my-first-run
+RUN="$HOME/quantassay-runs/my-first-run"
 SNAP="$HOME/models/llmcompare-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/<40位revision>"
 REV="<40位revision>"
 
@@ -96,6 +96,17 @@ python -m quantassay.gating \
   --revision "$REV" \
   --stage full
 ```
+
+### RMSNorm operator backend
+
+The default `--operator-backend sglang` uses SGLang's built-in kernels. To route Qwen3's RMSNorm paths through Kernscope, install Kernscope in the same WSL environment and choose `torch` or `triton`. QuantAssay owns the versioned SGLang adapter; Kernscope stays framework-independent:
+
+```bash
+python -m pip install -e /path/to/kernscope --no-deps  # replace with the Kernscope checkout path
+python -m quantassay.gating --run-dir "$HOME/quantassay-runs/kernscope-triton" --model-dir "$SNAP" --revision "$REV" --stage full --operator-backend triton
+```
+
+The selected backend is part of the run fingerprint and serving parameters. Use a new `--run-dir` when changing it. Both model sides within a run use the same operator backend.
 
 约 **20 分钟**（4 GB 卡，Qwen3-0.6B）。它会依次完成 8 个阶段：
 
@@ -107,8 +118,8 @@ preflight → bf16 → gptq → gptq_service → benchmark_bf16 → benchmark_gp
 **跑完看这里**：
 
 ```
-runs/my-first-run/report.md      ← 结论与取舍
-runs/my-first-run/report.html    ← 同上，可离线打开
+$HOME/quantassay-runs/my-first-run/report.md      ← 结论与取舍
+$HOME/quantassay-runs/my-first-run/report.html    ← 同上，可离线打开
 ```
 
 ### 只想先确认"能不能跑"
@@ -121,7 +132,7 @@ python -m quantassay.gating ... --stage all      # 约 10 分钟，只跑能力�
 
 ### 中断了怎么办
 
-**用完全相同的参数重跑即可。** 已成功并通过校验的阶段会跳过，只重做未完成的。进度记录在 `runs/<id>/run-status.json`。
+**用完全相同的参数重跑即可。** 已成功并通过校验的阶段会跳过，只重做未完成的。进度记录在 `$HOME/quantassay-runs/<id>/run-status.json`。
 
 一个例外：如果你**改了代码或换了版本**，指纹会变化，此时必须用**新的 `--run-dir`** —— 编排会明确拒绝在旧目录上续跑，而不是把两套条件的证据混在一起。
 
@@ -130,7 +141,7 @@ python -m quantassay.gating ... --stage all      # 约 10 分钟，只跑能力�
 ## 3. 理解产物
 
 ```
-runs/my-first-run/
+$HOME/quantassay-runs/my-first-run/
 ├── report.md / report.html        ← 先看这两个
 ├── regressions.json               ← 结构化结论（含可比性判定）
 ├── recommendations.json           ← 条件化建议
@@ -152,7 +163,7 @@ runs/my-first-run/
 
 **其他重要规则**：
 
-- `runs/<id>/` **不会被覆盖**。想重跑就换目录名。
+- `$HOME/quantassay-runs/<id>/` **不会被覆盖**。想重跑就换目录名。
 - **存在文件 ≠ 阶段成功**。以 `run-status.json` 里该阶段的状态为准 —— 失败阶段可能留下不完整的文件。
 - `artifacts/gptq-w4a16/` 只有在 manifest 和各文件 SHA256 全部校验通过后才会被复用。
 
@@ -164,7 +175,7 @@ runs/my-first-run/
 
 ```bash
 python -m quantassay.gating --stage full \
-  --run-dir runs/my-domain \
+  --run-dir "$HOME/quantassay-runs/my-domain" \
   --model-dir "$SNAP" --revision "$REV" \
   --corpus acme/domain-corpus \
   --corpus-split validation \
@@ -307,14 +318,14 @@ Advisor 只基于**已测的证据**给条件化建议：
 1. 两个数字都建立在 **只有 4 条校准样本** 之上 —— 这是可行性探针，不代表算法在正常校准集下的水平。**质量差距的方向可信，但幅度不可外推**。要下结论请把 `--quality-calibration-samples` 加到 64 以上并用你自己的数据重测。
 2. 上表的 GPTQ 是**专门为这次对照重跑**的：更早的一次 GPTQ 测量落在了那个已知的 run 间离散上（异常值），拿它比会把"异常"当成"算法差异"。**质量侧不受此影响**（困惑度可跨 run 复现到小数点后三位）。
 
-> 这些数字来自参考机器上的两次测量（每个 run 目录放一种方法）。`runs/` 是本地实验产物，不随仓库发布，所以请把它当作"这个工具能产出什么"的示例，而不是可直接引用的基准。
+> 这些数字来自参考机器上的两次测量（每个 run 目录放一种方法）。测量产物不随仓库发布，所以请把这些数字当作"这个工具能产出什么"的示例，而不是可直接引用的基准。
 
 **怎么自己复现这个对照**：
 
 ```bash
 # 两个 run 目录，一次一种方法，各自跑完整流程
-python -m quantassay.gating --run-dir runs/gptq-check --quant-method gptq --stage full ...
-python -m quantassay.gating --run-dir runs/awq-check  --quant-method awq  --stage full ...
+python -m quantassay.gating --run-dir "$HOME/quantassay-runs/gptq-check" --quant-method gptq --stage full ...
+python -m quantassay.gating --run-dir "$HOME/quantassay-runs/awq-check"  --quant-method awq  --stage full ...
 ```
 
 然后比较两份 `report.md` 的质量与 serving 两节。
@@ -338,7 +349,7 @@ python -m quantassay.gating --run-dir runs/awq-check  --quant-method awq  --stag
 **换方法必须换 run 目录。** 方法名进入 run 指纹，在同一目录里换方法会被拒绝 —— 否则上一方法的产物会被覆盖、两种算法的证据混在一个 run id 下。
 
 ```bash
-python -m quantassay.gating --run-dir runs/awq-check --quant-method awq --stage full ...
+python -m quantassay.gating --run-dir "$HOME/quantassay-runs/awq-check" --quant-method awq --stage full ...
 ```
 
 > **AWQ 的一个已知取舍**：上游 AWQ 的示例配方用**非对称**权重，但 sglang 的 kernel 分派要求**对称**权重，否则 checkpoint 无法服务。本工具因此对 AWQ 也用对称 W4A16。这牺牲了 AWQ 论文中 zero-point 补偿的一部分收益，是"能在本机服务"与"照搬上游配方"之间的取舍，已记录在产物的 `recipe.symmetric` 与 `recipe.note` 里。如果你用非对称 scheme，量化阶段就会报错而不是等到服务时才失败。
@@ -372,6 +383,7 @@ workload:
 |---|---|---|
 | `--mem-fraction-static` | 静态分配占显存比例；调小给 KV cache 留更多余量 | `0.8` |
 | `--cuda-graph-max-bs` | CUDA graph 捕获的最大 batch；调小省显存 | `2` |
+| `--operator-backend` | RMSNorm backend: `sglang`, Kernscope `torch`, or Kernscope `triton` | `sglang` |
 
 ```bash
 --mem-fraction-static 0.7
@@ -408,7 +420,7 @@ workload:
 改了渲染或分析代码后，**不要重跑测量** —— 重测会产生不同的数字、破坏原始证据。直接从已有的逐请求记录重建：
 
 ```bash
-python -m quantassay.reanalyze runs/my-first-run
+python -m quantassay.reanalyze "$HOME/quantassay-runs/my-first-run"
 ```
 
 它从 `serving-*.jsonl` 复算指标，重写 `regressions.json`、`recommendations.json`、`report.md/html`。

@@ -140,6 +140,7 @@ def test_workload_fingerprint_is_stable_and_input_sensitive() -> None:
 def _side(**params) -> dict:
     base = {
         "attention_backend": "triton",
+        "operator_backend": "sglang",
         "mem_fraction_static": 0.8,
         "cuda_graph_max_bs": 2,
         "disable_cuda_graph": False,
@@ -170,12 +171,14 @@ def test_cuda_graph_mismatch_blocks_the_comparison() -> None:
 
 def test_every_parameter_difference_is_reported() -> None:
     mismatches = compare_serving_parameters(
-        _side(), _side(mem_fraction_static=0.7, attention_backend="torch_native")
+        _side(),
+        _side(mem_fraction_static=0.7, attention_backend="torch_native", operator_backend="triton"),
     )
     joined = " ".join(mismatches)
     assert "mem_fraction_static" in joined
     assert "attention_backend" in joined
-    assert len(mismatches) == 2
+    assert "operator_backend" in joined
+    assert len(mismatches) == 3
 
 
 def test_missing_serving_parameters_are_reported_not_assumed_equal() -> None:

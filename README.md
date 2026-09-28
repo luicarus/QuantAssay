@@ -36,13 +36,19 @@ export PYTHONPATH=src
 
 # 一条命令跑完全流程：量化 → 服务评估 → 质量评估 → 报告
 python -m quantassay.gating \
-  --run-dir runs/my-first-run \
+  --run-dir "$HOME/quantassay-runs/my-first-run" \
   --model-dir "$HOME/models/llmcompare-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/<40位revision>" \
   --revision <40位revision> \
   --stage full
 ```
 
-结束后看 `runs/my-first-run/report.md`。
+结束后看 `$HOME/quantassay-runs/my-first-run/report.md`。
+
+### 选择 RMSNorm 后端
+
+默认 `--operator-backend sglang` 使用 SGLang 内置算子。要试 Kernscope，先在同一 WSL SGLang 环境安装它，例如 `python -m pip install -e /path/to/kernscope --no-deps`（替换成实际 checkout 路径），再选择 `--operator-backend torch` 或 `--operator-backend triton`。SGLang 0.5.3 适配层由 QuantAssay 管理；Kernscope 只提供可复用算子。
+
+在上面的完整流程命令中加入 `--operator-backend triton` 即可使用 Kernscope Triton。后端会进入 run 指纹和 serving 参数；切换后端必须使用新的 `--run-dir`，同一次 run 的 BF16 与量化侧使用同一后端。
 
 详见 **[用户指南](docs/guide.md)**（含环境准备、自己的数据集、结果解读、常见问题）。
 
