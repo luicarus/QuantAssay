@@ -1,6 +1,6 @@
-# Quantassay
+# QuantAssay
 
-Quantassay is a benchmarking pipeline for comparing a base model with its quantized counterpart on a real SGLang serving path.
+QuantAssay is a benchmarking pipeline for comparing a base model with its quantized counterpart on a real SGLang serving path.
 
 It supports GPTQ and AWQ W4A16 quantization, serving benchmarks, and perplexity evaluation. A separate BF16 scheduling experiment provides concurrent traffic replay, native scheduler observations, and an experimental SGLang 0.5.3 source patch for waiting-time compensation.
 
@@ -49,7 +49,7 @@ GPTQ and AWQ use the same symmetric W4A16 representation and the same Marlin exe
 
 Serving measurements are collected from streamed SGLang responses.
 
-For each request, Quantassay records timestamps for request submission, first output arrival, subsequent streamed chunks, and stream completion.
+For each request, QuantAssay records timestamps for request submission, first output arrival, subsequent streamed chunks, and stream completion.
 
 | Metric | Definition |
 |---|---|
@@ -66,8 +66,8 @@ Per-request measurements are stored as JSONL so aggregated metrics can be traced
 ## Quick start
 
 ```bash
-git clone https://github.com/luicarus/quantassay.git
-cd quantassay
+git clone https://github.com/luicarus/QuantAssay.git
+cd QuantAssay
 
 pip install -r requirements/execution-layer.txt
 export PYTHONPATH=src
@@ -96,7 +96,7 @@ $HOME/quantassay-runs/my-first-run/report.md
 
 ### RMSNorm backend
 
-The default `--operator-backend sglang` uses SGLang's built-in operators. To try Kernscope, install it in the same WSL SGLang environment, for example with `python -m pip install -e /path/to/kernscope --no-deps`, then select `--operator-backend torch` or `--operator-backend triton`. Quantassay manages the SGLang 0.5.3 adapter; Kernscope supplies reusable operators.
+The default `--operator-backend sglang` uses SGLang's built-in operators. To try Kernscope, install it in the same WSL SGLang environment, for example with `python -m pip install -e /path/to/kernscope --no-deps`, then select `--operator-backend torch` or `--operator-backend triton`. QuantAssay manages the SGLang 0.5.3 adapter; Kernscope supplies reusable operators.
 
 Add `--operator-backend triton` to the full-pipeline command above to use Kernscope Triton. The backend is part of the run fingerprint and serving parameters, so use a new `--run-dir` when switching backends and use the same backend for BF16 and quantized sides of a run.
 
@@ -218,7 +218,7 @@ Quality evaluation currently uses perplexity only.
 
 Perplexity is measured through the SGLang logprob path rather than a separate Transformers inference path.
 
-For paired evaluations, Quantassay also reports a bootstrap confidence interval for the perplexity difference.
+For paired evaluations, QuantAssay also reports a bootstrap confidence interval for the perplexity difference.
 
 Task-level metrics such as accuracy, exact match, F1, and output consistency are not implemented yet.
 

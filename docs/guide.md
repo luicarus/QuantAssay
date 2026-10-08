@@ -34,7 +34,7 @@
 ### 1.2 安装
 
 ```bash
-git clone <repo> && cd quantassay  # 或你 clone 时用的目录名
+git clone <repo> && cd QuantAssay  # 或你 clone 时用的目录名
 
 # 强烈建议用独立虚拟环境
 python -m venv ~/venvs/llmcompare
