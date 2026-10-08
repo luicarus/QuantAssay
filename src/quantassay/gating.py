@@ -800,7 +800,7 @@ def verify_quant_service_evidence(result: dict[str, Any]) -> bool:
 
 def serving_parameters(args: Any) -> dict[str, Any]:
     """The serving configuration the two sides must share exactly."""
-    return {
+    parameters = {
         "attention_backend": args.attention_backend,
         "operator_backend": args.operator_backend,
         "mem_fraction_static": args.mem_fraction_static,
@@ -811,6 +811,9 @@ def serving_parameters(args: Any) -> dict[str, Any]:
         "dtype": "bfloat16",
         "sglang_version": _package_version("sglang"),
     }
+    if getattr(args, "engine_identity", None) is not None:
+        parameters["engine_identity"] = args.engine_identity
+    return parameters
 
 
 def compare_serving_parameters(base: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
@@ -1671,6 +1674,7 @@ def _fingerprint(
     cuda_graph_max_bs: int = DEFAULT_CUDA_GRAPH_MAX_BS,
     quant_method: str = "gptq",
     operator_backend: str = DEFAULT_OPERATOR_BACKEND,
+    engine_identity: dict[str, Any] | None = None,
 ) -> str:
     """Bind a run to its model content, serving configuration and method.
 
@@ -1694,6 +1698,7 @@ def _fingerprint(
         "mem_fraction_static": mem_fraction,
         "attention_backend": attention_backend,
         "operator_backend": operator_backend,
+        "engine_identity": engine_identity,
         "cuda_graph_max_bs": cuda_graph_max_bs,
         "quant_method": quant_method,
         "torch": _package_version("torch"),
@@ -1705,6 +1710,7 @@ def _fingerprint(
         "psutil": _package_version("psutil"),
         "python": platform.python_version(),
         "controller_sha256": file_sha256(Path(__file__)),
+        "engine_selector_sha256": file_sha256(Path(__file__).with_name("engine.py")),
         "quant_worker_sha256": file_sha256(Path(__file__).with_name("quantize_worker.py")),
         "source_files": hashes,
         "source_files_digest": hashlib.sha256(
@@ -1991,8 +1997,15 @@ def main(argv: list[str] | None = None) -> int:
             "unambiguous serving configuration"
         ),
     )
+    parser.add_argument("--engine-source", type=Path,
+                        help="SGLang fork Python directory; dependencies stay in the execution environment")
     args = parser.parse_args(argv)
     try:
+        from quantassay.engine import configure_engine_source
+        try:
+            args.engine_identity = configure_engine_source(args.engine_source)
+        except ValueError as exc:
+            raise ProbeError(str(exc)) from exc
         if not _REVISION_RE.fullmatch(args.revision):
             raise ProbeError("revision must be a 40-character commit SHA")
         if args.quant_timeout_minutes <= 0:
@@ -2021,6 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
                 operator_backend=args.operator_backend,
                 cuda_graph_max_bs=args.cuda_graph_max_bs,
                 quant_method=args.quant_method,
+                engine_identity=args.engine_identity,
             ),
         )
         # Bound once, used by every stage condition below so the method is never

@@ -2,7 +2,9 @@
 
 QuantAssay is a benchmarking pipeline for comparing a base model with its quantized counterpart on a real SGLang serving path.
 
-It supports GPTQ and AWQ W4A16 quantization, serving benchmarks, and perplexity evaluation. A separate BF16 scheduling experiment provides concurrent traffic replay, native scheduler observations, and an experimental SGLang 0.5.3 source patch for waiting-time compensation.
+It supports GPTQ and AWQ W4A16 quantization, serving benchmarks, and perplexity evaluation. A separate BF16 scheduling experiment provides concurrent traffic replay and native scheduler observations.
+
+The project uses two repositories: **QuantAssay** owns evaluation and experiment evidence; the [dedicated SGLang fork branch](https://github.com/luicarus/sglang/tree/codex/quantassay-scheduler-v0.5.3) owns waiting-aware scheduling, based on upstream SGLang v0.5.3. The fork's contribution branches are managed independently.
 
 The pipeline covers:
 
@@ -73,6 +75,17 @@ pip install -r requirements/execution-layer.txt
 export PYTHONPATH=src
 ```
 
+Select the maintained fork sources:
+
+```bash
+git clone --depth 1 --single-branch \
+  --branch codex/quantassay-scheduler-v0.5.3 \
+  https://github.com/luicarus/sglang.git "$HOME/src/quantassay-sglang"
+ENGINE="$HOME/src/quantassay-sglang/python"
+```
+
+`--engine-source` selects that Python source tree while using the locked serving dependencies from the current environment. Omitting it uses the environment's installed SGLang.
+
 Run the full pipeline:
 
 ```bash
@@ -83,6 +96,7 @@ python -m quantassay.gating \
   --run-dir "$HOME/quantassay-runs/my-first-run" \
   --model-dir "$SNAP" \
   --revision "$REV" \
+  --engine-source "$ENGINE" \
   --stage full
 ```
 
@@ -109,11 +123,11 @@ The independent scheduling entry point currently supports SGLang 0.5.3 and Qwen3
 ```bash
 python -m quantassay.scheduling \
   --run-dir "$HOME/quantassay-runs/scheduling-fcfs-01" \
-  --model-dir "$SNAP" --revision "$REV" --policy fcfs
+  --model-dir "$SNAP" --revision "$REV" --policy fcfs --engine-source "$ENGINE"
 
 python -m quantassay.scheduling \
   --run-dir "$HOME/quantassay-runs/scheduling-lpm-01" \
-  --model-dir "$SNAP" --revision "$REV" --policy lpm \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm --engine-source "$ENGINE" \
   --trace-file "$HOME/quantassay-runs/scheduling-fcfs-01/workload.json"
 ```
 
@@ -123,18 +137,9 @@ Each run saves `workload.json`, `manifest.json`, client and scheduler request JS
 
 ### Experimental LPM waiting compensation
 
-[The source patch](patches/sglang-0.5.3-lpm-aging.patch) adds `lpm-aging` to SGLang's request scheduler. Requests below the wait threshold retain LPM ordering; requests at or above it are prioritized in queue-entry order. The default threshold is 1000 ms, configurable with `--aging-threshold-ms`. It changes priority, and does not guarantee admission or completion within one second.
+The [fork implementation](https://github.com/luicarus/sglang/blob/codex/quantassay-scheduler-v0.5.3/python/sglang/srt/managers/schedule_policy.py) adds `lpm-aging` and makes it the branch's default scheduler. Requests below the wait threshold retain LPM ordering; requests at or above it are prioritized in queue-entry order. The default threshold is 1000 ms, configurable with `--aging-threshold-ms` in the scheduling experiment or `SGLANG_LPM_MAX_WAIT_MS` when launching the fork directly. It changes priority, and does not guarantee admission or completion within one second.
 
-Prepare an isolated copy of the installed SGLang sources in Linux/WSL, using GNU `patch`:
-
-```bash
-ENGINE="$HOME/quantassay-engines/sglang053-lpm-aging"
-python -m quantassay.prepare_sglang \
-  --output "$ENGINE" \
-  --patch patches/sglang-0.5.3-lpm-aging.patch
-```
-
-The original installation is preserved. Both policies below run from the same source copy: `lpm` follows the native branch and `lpm-aging` follows the added branch. `warm-shared` primes the shared prefix after flushing the cache; priming is excluded from the timed measurements.
+Use `ENGINE` from the fork checkout above. Both policies below run from the same checkout: `lpm` follows the native branch and `lpm-aging` follows the added branch. `warm-shared` primes the shared prefix after flushing the cache; priming is excluded from the timed measurements. The [portable patch](patches/sglang-0.5.3-lpm-aging.patch) and preparation helper remain available to reproduce earlier installed-source prototypes.
 
 ```bash
 for policy in lpm lpm-aging; do
@@ -147,7 +152,7 @@ for policy in lpm lpm-aging; do
 done
 ```
 
-Model hashes, input/arrival trace, engine and controller source hashes, cache-start protocol, and other serving parameters must match when comparing policies. Logs record whether the added branch loaded and encountered requests over the threshold.
+Model hashes, input/arrival trace, engine and controller source hashes, cache-start protocol, and other serving parameters must match when comparing policies. Engine identity includes its actual Git commit, branch, dirty state and source hashes. Pin a commit for experiments; use new run directories after source changes. Logs record whether the added branch loaded and encountered requests over the threshold.
 
 In two alternating warm-cache comparisons on the tested 4 GB GPU, using the default synthetic load, median native queue times were:
 
@@ -159,7 +164,7 @@ In two alternating warm-cache comparisons on the tested 4 GB GPU, using the defa
 
 Independent requests waited less, while shared-prefix requests waited longer. Maximum overall wait decreased in those warm-cache runs, but did not improve in a supplementary cold-cache comparison. Throughput changes were inconsistent. These observations demonstrate a fairness tradeoff under an overloaded synthetic workload; they do not establish general acceleration. One cold-cache run also had anomalous decode timings and uncertain GPU-release readings; its unchanged repeat recovered, and the cause remains unresolved.
 
-See [the user guide](docs/guide.md#实验性-lpm-等待补偿) for parameters, evidence files, and limitations. The patch changes queue ordering; KV allocation and execution kernels retain their existing implementation.
+See [the user guide](docs/guide.md#实验性-lpm-等待补偿) and [fork branch notes](https://github.com/luicarus/sglang/blob/codex/quantassay-scheduler-v0.5.3/QUANTASSAY.md) for parameters, evidence files, and limitations. The change affects queue ordering; KV allocation and execution kernels retain their existing implementation. Measurements above came from the earlier installed-source prototype, not a new GPU campaign on this Git checkout.
 
 ## Example output
 

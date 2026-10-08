@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from quantassay.contracts import sha256_of
+from quantassay.engine import configure_engine_source
 from quantassay.experiments.store import atomic_write_json
 from quantassay.gating import (
     MODEL_ID, _package_version, build_bf16_command, contention_blockers,
@@ -102,12 +103,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("aging threshold must be finite and positive")
     if args.policy == "lpm-aging" and not args.engine_source:
         parser.error("lpm-aging requires the patched isolated --engine-source")
+    try:
+        engine_identity = configure_engine_source(args.engine_source)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.engine_source:
         args.engine_source = args.engine_source.resolve()
-        if not (args.engine_source / "sglang/srt/managers/schedule_policy.py").is_file():
-            parser.error("engine source does not contain an sglang package")
-        sys.path.insert(0, str(args.engine_source))
-        os.environ["PYTHONPATH"] = str(args.engine_source) + os.pathsep + os.environ.get("PYTHONPATH", "")
     os.environ["SGLANG_LPM_MAX_WAIT_MS"] = str(args.aging_threshold_ms)
     if args.run_dir.exists():
         parser.error("run directory already exists; use a new directory to preserve evidence")
@@ -162,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             "replayed_trace_fingerprint": replayed_fingerprint,
             "traffic_fingerprint": sha256_of(trace["requests"]),
             "engine_package": str(Path(importlib.util.find_spec("sglang").origin).parent),
+            "engine_identity": engine_identity,
             "environment_overrides": {"SGLANG_LPM_MAX_WAIT_MS": str(args.aging_threshold_ms)},
             "cache_prime_gap_seconds": 0.2 if args.cache_start == "warm-shared" else 0,
             "source_model_hashes": source_file_hashes(args.model_dir),
@@ -171,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
                 "serving/scheduling.py": file_sha256(Path(__file__).parent / "serving/scheduling.py"),
                 "serving/evaluator.py": file_sha256(Path(__file__).parent / "serving/evaluator.py"),
                 "gating.py": file_sha256(Path(__file__).with_name("gating.py")),
+                "engine.py": file_sha256(Path(__file__).with_name("engine.py")),
             },
             "versions": {name: _package_version(name) for name in
                          ("sglang", "torch", "transformers", "triton")},

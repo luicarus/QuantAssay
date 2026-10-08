@@ -525,6 +525,25 @@ python -m quantassay.scheduling \
 
 ### 实验性 LPM 等待补偿
 
+调度改动现在维护在 [SGLang fork 专用分支](https://github.com/luicarus/sglang/tree/codex/quantassay-scheduler-v0.5.3)，基于上游 `v0.5.3`。QuantAssay 负责实验与观测，不内嵌整套推理框架。该分支默认使用 `lpm-aging`；提上游 PR 的分支独立维护。
+
+```bash
+git clone --depth 1 --single-branch \
+  --branch codex/quantassay-scheduler-v0.5.3 \
+  https://github.com/luicarus/sglang.git "$HOME/src/quantassay-sglang"
+ENGINE="$HOME/src/quantassay-sglang/python"
+
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/fork-aging-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm-aging \
+  --engine-source "$ENGINE" --cache-start warm-shared
+```
+
+完整量化流程同样支持 `python -m quantassay.gating ... --engine-source "$ENGINE"`。
+依赖沿用当前执行环境；服务子进程与控制器选择同一源码目录。源码实际版本须为 0.5.3，Git commit、分支、工作区 dirty 状态与实际源码哈希进入身份记录；版本字符串相同不代表代码相同。建议固定 commit 再测量，源码变化后使用新 run 目录。原来已安装的 SGLang 不会被重装或覆盖。
+
+以下复制源码与应用补丁的方式用于复现旧实验；后续开发以 fork 分支为准。
+
 仓库提供 `patches/sglang-0.5.3-lpm-aging.patch`，修改 SGLang 0.5.3 的 `SchedulePolicy` 和策略参数选项，新增 `lpm-aging`。未达到阈值时保留原生 LPM 与批内重复前缀降优先级行为；达到阈值的请求优先按当前入队时间排序。超过 128 个排队请求时沿用 FCFS 回退。阈值表示何时补偿优先级，不保证请求在阈值内获准执行；KV 分配、请求准入与模型 kernel 保持原生实现。这个策略是实验原型，效果须按负载实测。
 
 在 Linux/WSL 的原有执行环境中，使用 GNU `patch`，复制已安装的 SGLang 源码并应用补丁：
