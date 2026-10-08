@@ -1725,6 +1725,8 @@ def build_bf16_command(
     cuda_graph_max_bs: int = DEFAULT_CUDA_GRAPH_MAX_BS,
     sglang_version: str | None = None,
     disable_cuda_graph: bool = False,
+    context_length: int = 512,
+    max_running_requests: int = 1,
 ) -> list[str]:
     if not 0.5 <= mem_fraction <= 0.9:
         raise ProbeError("mem_fraction_static must be between 0.5 and 0.9")
@@ -1743,6 +1745,8 @@ def build_bf16_command(
             raise ProbeError("QuantAssay's Kernscope adapter requires SGLang 0.5.3")
     if not 1 <= cuda_graph_max_bs <= 8:
         raise ProbeError("cuda-graph-max-bs must be between 1 and 8")
+    if context_length < 1 or max_running_requests < 1:
+        raise ProbeError("context length and max running requests must be positive")
     module = (
         "sglang.launch_server"
         if operator_backend == "sglang"
@@ -1765,11 +1769,11 @@ def build_bf16_command(
         "--attention-backend",
         attention_backend,
         "--context-length",
-        "512",
+        str(context_length),
         "--mem-fraction-static",
         str(mem_fraction),
         "--max-running-requests",
-        "1",
+        str(max_running_requests),
     ]
     # The CUDA-graph cap flag differs by version: 0.5.20 split it per phase,
     # 0.5.3 exposes a combined --cuda-graph-max-bs. Version-gate the choice so

@@ -2,7 +2,7 @@
 
 Quantassay is a benchmarking pipeline for comparing a base model with its quantized counterpart on a real SGLang serving path.
 
-It currently supports GPTQ and AWQ W4A16 quantization, serving benchmarks, and perplexity evaluation.
+It supports GPTQ and AWQ W4A16 quantization, serving benchmarks, and perplexity evaluation. A separate BF16 scheduling experiment provides concurrent traffic replay, native scheduler observations, and an experimental SGLang 0.5.3 source patch for waiting-time compensation.
 
 The pipeline covers:
 
@@ -11,6 +11,8 @@ The pipeline covers:
 - TTFT, TPOT, ITL, request throughput, and output-token throughput;
 - perplexity evaluation through SGLang logprobs;
 - reproducible comparison reports in Markdown and HTML.
+
+Scheduling experiments additionally record planned and actual request arrivals, native queue times, cached prompt tokens, and sampled scheduler/KV metrics. Their reports are separate from the quantization pipeline.
 
 The serving benchmark does not use `Transformers.generate()` as a proxy for deployment performance. Requests are sent to a live OpenAI-compatible SGLang endpoint and measured from the client side.
 
@@ -52,7 +54,7 @@ For each request, Quantassay records timestamps for request submission, first ou
 | Metric | Definition |
 |---|---|
 | TTFT | Time from request submission to the first output chunk |
-| TPOT | Average generation time per output token after the first token |
+| TPOT | `(E2E - TTFT) / (output_tokens - 1)`; unavailable below two output tokens |
 | ITL | Time between consecutive streamed output chunks |
 | Output throughput | Successful output tokens divided by measured wall time |
 | Request throughput | Successful requests divided by measured wall time |
@@ -74,12 +76,17 @@ export PYTHONPATH=src
 Run the full pipeline:
 
 ```bash
+REV=c1899de289a04d12100db370d81485cdf75e47ca
+SNAP="$HOME/models/llmcompare-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/$REV"
+
 python -m quantassay.gating \
   --run-dir "$HOME/quantassay-runs/my-first-run" \
-  --model-dir "$HOME/models/llmcompare-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/<revision>" \
-  --revision <revision> \
+  --model-dir "$SNAP" \
+  --revision "$REV" \
   --stage full
 ```
+
+Set `SNAP` to your local source-model snapshot. The commands below reuse the same `SNAP` and `REV`.
 
 The final report is written to:
 
@@ -94,6 +101,65 @@ The default `--operator-backend sglang` uses SGLang's built-in operators. To try
 Add `--operator-backend triton` to the full-pipeline command above to use Kernscope Triton. The backend is part of the run fingerprint and serving parameters, so use a new `--run-dir` when switching backends and use the same backend for BF16 and quantized sides of a run.
 
 See [docs/guide.md](docs/guide.md) for environment setup, configuration, custom datasets, and result interpretation.
+
+## Concurrent scheduling experiments
+
+The independent scheduling entry point currently supports SGLang 0.5.3 and Qwen3-0.6B BF16. Run the native FCFS and longest-prefix-match (LPM) policies sequentially:
+
+```bash
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/scheduling-fcfs-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy fcfs
+
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/scheduling-lpm-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm \
+  --trace-file "$HOME/quantassay-runs/scheduling-fcfs-01/workload.json"
+```
+
+Defaults are 60 requests at 16 requests/s, 64 client workers, and at most 4 running server requests. The fixed seed generates shared long prefixes, independent long inputs, and independent short inputs, with output caps of 32/64/96 tokens. Arrival modes include fixed intervals, Poisson arrivals, and bursts. `--trace-file` replays saved token IDs and arrival offsets; client dispatch delay remains visible when the worker cap is reached.
+
+Each run saves `workload.json`, `manifest.json`, client and scheduler request JSONL, sampled native metrics, server logs, `scheduling-result.json`, and `report.md`. Queue time comes from native request-time logs, not from subtracting an estimate from TTFT. Every invocation requires a new run directory.
+
+### Experimental LPM waiting compensation
+
+[The source patch](patches/sglang-0.5.3-lpm-aging.patch) adds `lpm-aging` to SGLang's request scheduler. Requests below the wait threshold retain LPM ordering; requests at or above it are prioritized in queue-entry order. The default threshold is 1000 ms, configurable with `--aging-threshold-ms`. It changes priority, and does not guarantee admission or completion within one second.
+
+Prepare an isolated copy of the installed SGLang sources in Linux/WSL, using GNU `patch`:
+
+```bash
+ENGINE="$HOME/quantassay-engines/sglang053-lpm-aging"
+python -m quantassay.prepare_sglang \
+  --output "$ENGINE" \
+  --patch patches/sglang-0.5.3-lpm-aging.patch
+```
+
+The original installation is preserved. Both policies below run from the same source copy: `lpm` follows the native branch and `lpm-aging` follows the added branch. `warm-shared` primes the shared prefix after flushing the cache; priming is excluded from the timed measurements.
+
+```bash
+for policy in lpm lpm-aging; do
+  python -m quantassay.scheduling \
+    --run-dir "$HOME/quantassay-runs/${policy}-warm-01" \
+    --model-dir "$SNAP" --revision "$REV" --policy "$policy" \
+    --engine-source "$ENGINE" --cache-start warm-shared \
+    --aging-threshold-ms 1000 \
+    --trace-file "$HOME/quantassay-runs/scheduling-fcfs-01/workload.json"
+done
+```
+
+Model hashes, input/arrival trace, engine and controller source hashes, cache-start protocol, and other serving parameters must match when comparing policies. Logs record whether the added branch loaded and encountered requests over the threshold.
+
+In two alternating warm-cache comparisons on the tested 4 GB GPU, using the default synthetic load, median native queue times were:
+
+| Request group | Native LPM | LPM with waiting compensation |
+|---|---:|---:|
+| Independent long inputs | 5.55–6.67 s | 2.78–2.83 s |
+| Independent short inputs | 5.47–6.30 s | 3.04–3.07 s |
+| Shared long prefixes | 0.90–2.08 s | about 3.02 s |
+
+Independent requests waited less, while shared-prefix requests waited longer. Maximum overall wait decreased in those warm-cache runs, but did not improve in a supplementary cold-cache comparison. Throughput changes were inconsistent. These observations demonstrate a fairness tradeoff under an overloaded synthetic workload; they do not establish general acceleration. One cold-cache run also had anomalous decode timings and uncertain GPU-release readings; its unchanged repeat recovered, and the cause remains unresolved.
+
+See [the user guide](docs/guide.md#实验性-lpm-等待补偿) for parameters, evidence files, and limitations. The patch changes queue ordering; KV allocation and execution kernels retain their existing implementation.
 
 ## Example output
 
@@ -114,7 +180,7 @@ Perplexity change: +39.80%
 paired 95% interval: +36.67% ... +43.14%
 ```
 
-Results are only compared when the two runs satisfy the configured comparability checks.
+Quantization reports only compare results when the two runs satisfy the configured comparability checks.
 
 ## Custom evaluation data
 
@@ -194,7 +260,9 @@ SGLang execution requires Linux or WSL2. The repository itself can still be edit
 - The default calibration set contains four prompts and is intended as a functional test rather than a representative quantization study.
 - Serving measurements can show run-to-run variance, especially on small consumer GPUs.
 - ITL is derived from streamed response chunks. A streamed chunk is not guaranteed to correspond to exactly one tokenizer token.
-- The current benchmark runs requests sequentially and does not represent high-concurrency production traffic.
+- The default quantization benchmark runs requests sequentially. The separate BF16 scheduling baseline supports concurrent arrival-trace replay; see [the user guide](docs/guide.md#并发调度基准bf16). Neither synthetic workload establishes production-scale performance.
+- Scheduling gauges are sampled, rather than a complete trace of every GPU batch. Cache eviction counts and KV admission-block counts are currently unavailable.
+- `lpm-aging` is an experimental source patch for SGLang 0.5.3. Its fairness and throughput tradeoffs depend on load and cache state; quality and deployment suitability have not been evaluated.
 
 ## Project structure
 
@@ -207,8 +275,11 @@ src/quantassay/
 ├── serving/
 │   ├── benchmark.py
 │   ├── evaluator.py
+│   ├── scheduling.py  concurrent replay and native scheduler evidence
 │   └── workload.py
 ├── gating.py       pipeline orchestration
+├── scheduling.py   BF16 scheduling experiment CLI
+├── prepare_sglang.py  isolated SGLang source patch preparation
 └── quantize_worker.py
 ```
 

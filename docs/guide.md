@@ -473,7 +473,7 @@ GPU 部分不行，SGLang 不支持 Windows。可以在 Windows 编辑代码，�
 | **量化方法** | 已实现 **GPTQ** 与 **AWQ**（`--quant-method`）。FP8 / INT8 未实现；FP8 还需支持它的硬件 |
 | **模型 id 写死** | 当前固定 `Qwen/Qwen3-0.6B`，换模型需改 `contracts.py` |
 | **`final` 留出集未使用** | 目前只用 `dev` 分割。按 PRD 设计，`final` 应在方案固定后再跑 |
-| **并发只测过 1** | 负载矩阵（多并发/多长度）未实现 |
+| **并发负载** | 默认量化基准仍为串行；独立 BF16 调度基准支持混合长度、共享前缀和并发到达重放，尚不代表生产规模 |
 
 **证据纪律**（工具本身强制）：
 
@@ -482,3 +482,76 @@ GPU 部分不行，SGLang 不支持 Windows。可以在 Windows 编辑代码，�
 - 两侧服务参数不一致**拒绝出百分比**；
 - 差异在 ±1% 内视为噪声；
 - 每个数字都能回到逐请求/逐文档的原始 JSONL。
+
+## 并发调度基准（BF16）
+
+`python -m quantassay.scheduling` 是独立的 SGLang 0.5.3 / Qwen3-0.6B BF16 实验入口，用于建立原生 FCFS/LPM 调度基线。它通过原生 `/generate` 流式接口评估，在一个服务内并发请求。
+
+在已准备好的执行环境中，使用前文的 `$SNAP`、`$REV`，依次运行：
+
+```bash
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/scheduling-fcfs-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy fcfs
+
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/scheduling-lpm-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm \
+  --trace-file "$HOME/quantassay-runs/scheduling-fcfs-01/workload.json"
+```
+
+默认值为 60 个请求、64 个客户端 worker、服务端最多 4 个运行请求、每秒 16 个固定间隔到达、种子 42、context length 512、CUDA graph 最大 batch 4、`mem-fraction-static=0.8`。客户端 worker 上限与服务端运行请求上限是独立设置。`--arrival-mode {burst,fixed,poisson}` 支持突发、固定间隔、固定种子的泊松到达；`--requests`、`--concurrency`、`--request-rate`、`--seed` 可调整生成负载。`--trace-file` 重放已保存的 token ID 与到达时间，覆盖请求生成参数，并校验内容指纹。每次使用新 run 目录。
+
+负载按请求数约 60% 共享长前缀、20% 独立长输入、20% 独立短输入组成；目标输入长度约 320/64 token，输出上限循环为 32/64/96 token，实际长度完整记录。显式关闭 thinking，temperature 为 0。先执行 3 个 16-token 预热请求，再清空 radix cache 后开始计时；计时过程中允许前缀复用。此负载用于性能诊断，输出是否达到上限会在结果中披露。
+
+到达计划在发出请求前固定，不依赖前一个响应的完成时间。客户端 worker 不足时仍保留计划时间并记录 `dispatch_lag_ms`；超过 25 ms 会标记 `client_dispatch_delayed`，不能把客户端积压解释成服务端调度效果。TTFT 从实际发出请求计时，计划到达至完成的时间另列为 `arrival_to_completion_ms`。
+
+| 文件 | 内容 |
+|---|---|
+| `workload.json` | 请求文本、token ID、输入哈希、输出预算、到达时间与负载指纹 |
+| `manifest.json` | 模型文件哈希、引擎关键源码哈希、控制器哈希、版本与完整服务命令 |
+| `requests.jsonl` | 完成即落盘的客户端逐请求延迟、实际 token 数、失败与发送延迟 |
+| `scheduler-requests.jsonl` | 按请求 ID 对齐的原生排队时间、缓存 token 数、服务日志行号 |
+| `scheduler-metrics.jsonl` | 每 0.2 秒采样的等待/运行请求、KV token 使用量等指标，保留 series 标签 |
+| `logs/server.log` | 原生服务、batch 与请求时间日志 |
+| `scheduling-result.json` / `report.md` | 整体及请求组的分布、成功数、资源数据与限制 |
+| `run-status.json` | 执行结果、观测完整性与结果文件哈希 |
+
+原生排队时间来自调度器入队到第一次 forward，**不能用 TTFT 反推**；原生时间日志以毫秒舍入。运行请求数 gauge 是采样值，不是每个 GPU batch 的完整轨迹；ITL 是流式 chunk 间隔。缓存淘汰次数、因 KV 不足未获准入的次数目前明确标为 `unavailable`。进程树 RSS 只作诊断，共享页可能被重复计算。
+
+对照需要模型文件、负载指纹、关键引擎源码、控制器版本与其他服务参数一致，仅调度策略不同。一次对照用于建立基线，稳定结论需要独立重复与交替顺序；此实验不产生量化收益、质量或部署结论。
+
+“共享前缀”是请求内容类别，不代表请求到达时已有长前缀命中；独立输入也可能复用短的公共 chat template。应以逐请求 `cached_tokens` 和排队时间判断实际行为。即使负载与冷启动策略一致，缓存建立的早晚仍可能改变后续调度顺序；总缓存命中量不能替代按请求组观察公平性。
+
+### 实验性 LPM 等待补偿
+
+仓库提供 `patches/sglang-0.5.3-lpm-aging.patch`，修改 SGLang 0.5.3 的 `SchedulePolicy` 和策略参数选项，新增 `lpm-aging`。未达到阈值时保留原生 LPM 与批内重复前缀降优先级行为；达到阈值的请求优先按当前入队时间排序。超过 128 个排队请求时沿用 FCFS 回退。阈值表示何时补偿优先级，不保证请求在阈值内获准执行；KV 分配、请求准入与模型 kernel 保持原生实现。这个策略是实验原型，效果须按负载实测。
+
+在 Linux/WSL 的原有执行环境中，使用 GNU `patch`，复制已安装的 SGLang 源码并应用补丁：
+
+```bash
+python -m quantassay.prepare_sglang \
+  --output "$HOME/quantassay-engines/sglang053-lpm-aging" \
+  --patch patches/sglang-0.5.3-lpm-aging.patch
+```
+
+此命令创建独立副本并保存原始/修改后源码哈希，不改动原安装。后续 `--engine-source` 指向包含 `sglang/` 的新目录，服务进程与观测代码均使用该目录；两组对照使用同一个源码副本，`lpm` 走原生分支，`lpm-aging` 走新增分支。补丁文件也可在 SGLang 0.5.3 仓库的 `python/` 目录内应用。
+
+```bash
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/lpm-warm-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm \
+  --engine-source "$HOME/quantassay-engines/sglang053-lpm-aging" \
+  --cache-start warm-shared
+
+python -m quantassay.scheduling \
+  --run-dir "$HOME/quantassay-runs/lpm-aging-warm-01" \
+  --model-dir "$SNAP" --revision "$REV" --policy lpm-aging \
+  --engine-source "$HOME/quantassay-engines/sglang053-lpm-aging" \
+  --cache-start warm-shared --aging-threshold-ms 1000 \
+  --trace-file "$HOME/quantassay-runs/lpm-warm-01/workload.json"
+```
+
+`--cache-start` 默认 `cold`；`warm-shared` 在清缓存后额外发送一个共享长前缀请求（输出上限 16 token），保存 `cache-prime.jsonl`，响应完成后等待 0.2 秒再开始计时。实际缓存启动协议进入负载指纹，输入/到达记录另有 `traffic_fingerprint`，不能混比冷/暖缓存结果。该预置请求不计入吞吐和延迟统计。
+
+`--aging-threshold-ms` 默认 1000，通过服务进程的 `SGLANG_LPM_MAX_WAIT_MS` 设置，进入 run 指纹。日志与结果分别记录补偿策略是否加载、是否真的遇到超阈值队列。结果包含各请求组排队时间的 p50/p95/p99/max；需要同时考察被补偿请求与共享前缀请求的代价，以及总体吞吐。
