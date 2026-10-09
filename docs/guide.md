@@ -585,6 +585,14 @@ python -m quantassay.scheduling \
 
 此实验使用独立的 SGLang 0.5.3 源码分支。在每轮组批前，根据活跃 Decode 请求数选择 chunk 总预算：0–1 个使用上限，2 个使用中间预算，3 个及以上使用最小预算。原生 PrefillAdder 会扣除 Decode token；KV、请求槽约束和 LPM 排序仍由原生路径处理。新开关默认关闭，需要显式选择 `--policy lpm` 来固定本轮排序策略。
 
+在现有 SGLang 0.5.3 执行环境中获取专用分支，不需要替换已安装的依赖：
+
+```bash
+git clone --single-branch --branch codex/quantassay-adaptive-prefill-v0.5.3 \
+  https://github.com/luicarus/sglang.git "$HOME/quantassay-engines/sglang053-adaptive-prefill"
+ENGINE="$HOME/quantassay-engines/sglang053-adaptive-prefill/python"
+```
+
 把包含 `sglang/` 包的源码目录设置为 `$ENGINE`，模型快照与 revision 设置为 `$SNAP`、`$REV`。固定 128、固定 512 和动态 128–512 三组采用同一源码和 trace，并依次运行：
 
 ```bash
@@ -593,8 +601,9 @@ common=(--model-dir "$SNAP" --revision "$REV" --policy lpm
   --max-running-requests 4 --cuda-graph-max-bs 4 --mem-fraction-static 0.8
   --enable-mixed-chunk --trace-prefill-budgets
   --prefix-profile unique --short-input-tokens 64 --long-input-tokens 512
-  --output-budgets 64 128 192 --requests 60 --arrival-mode phased --phase-rates 1 12 1
-  --warmup-requests 8 --warmup-concurrency 4 --warmup-output-tokens 64)
+  --output-budgets 64 128 192 --ignore-eos
+  --requests 60 --arrival-mode phased --phase-rates 1 12 1
+  --warmup-requests 8 --warmup-concurrency 4 --warmup-output-tokens 192)
 
 python -m quantassay.scheduling "${common[@]}" \
   --run-dir "$HOME/quantassay-runs/prefill-fixed128-01" --chunked-prefill-size 128
@@ -610,8 +619,27 @@ python -m quantassay.scheduling "${common[@]}" --trace-file "$trace" \
 
 参数默认值保持原有负载：`--prefix-profile mixed`、短/长输入目标 64/320、输出预算 32/64/96、`--arrival-mode fixed`、`--request-rate 16`。`phased` 将请求等分为三阶段，到达率默认 1/12/1 请求每秒；请求数必须能被 3 整除。生成输入保存实际 token 数，长度目标不替代真实统计。重放时从 trace 恢复生成参数、到达阶段和输入，不能混用不同负载。
 
-预热默认 3 请求、并发 1、输出上限 16；本例改为 8 请求、并发 4、输出上限 64，覆盖 mixed chunk 形状，完成后清空缓存再计时。所有预热记录保存在 `warmup.jsonl`。
+预热默认 3 请求、并发 1、输出上限 16；本例改为 8 请求、并发 4、输出上限 192，覆盖更长 Decode 和 mixed chunk 形状，完成后清空缓存再计时。所有预热记录保存在 `warmup.jsonl`。服务随机种子统一使用 `--seed`（默认 42）。
+
+`--ignore-eos` 默认关闭；本例开启后忽略 EOS，要求每个计时请求生成完整的预算长度，避免不同结束长度影响排队工作量。协议进入 trace 指纹，重放时使用已保存协议；输出数量不符会保留为失败请求。这是固定计算量的合成性能负载，不用于评价自然结束行为或输出质量。
 
 `prefill-events.jsonl` 保存源码事件及服务日志行号，区分预热和计时请求。`scheduling-result.json` 报告实际预算直方图、Decode 压力、组批 token 数、停止原因和 KV token 范围。free 与 evictable 分开记录；后者并非已经空闲的显存。连续相同阻挡状态会去重，事件数不是失败请求数；实际 eviction 数仍为 unavailable。
 
 报告同时提供按到达阶段归类的请求 TTFT/TPOT 和各计划时间窗口内的 ITL。窗口 ITL 包含前阶段积压请求，按后一 chunk 的到达时间归类；阶段标签不能证明服务压力已下降。先确认源码观测确实出现多种动态预算，再判断延迟与吞吐的取舍。这些事件记录的是主机侧组批准备，不能当成 GPU 执行耗时。一次对照不能证明稳定收益。
+
+#### 2026-10-09 实测筛选
+
+上述 BF16 分段负载在 4 GB RTX 3050 Ti Laptop / WSL2 上完成。统一固定输出协议下的有效三组，各 60/60 成功、输出 7680 token；模型、负载、控制器和引擎源码指纹一致，其余实际服务参数一致。
+
+| 指标 | 固定 128 | 固定 512 | 动态 128–512 |
+|---|---:|---:|---:|
+| 第一低负载阶段长输入 TTFT p50，ms | 125.991 | 55.411 | 53.826 |
+| 整体 TTFT p95，ms | 5809.734 | 4994.204 | 5832.543 |
+| 整体 ITL p95，ms | 10.243 | 9.839 | 10.248 |
+| 输出 tok/s | 182.150 | 182.136 | 182.176 |
+
+动态组实际出现 108 次 prepared 事件：512=33、256=6、128=69；每组覆盖全部计时请求，实际 Prefill token 为正且不超过扣除 Decode 后的预算。动态组改善了相对固定 128 的低负载长输入 TTFT，但相对固定 512，整体 TTFT/ITL 尾部更差，吞吐差异落在噪声范围内。整体吞吐还受低到达率空闲窗口限制，不能代表饱和容量收益。新功能保持默认关闭，当前结果不支持宣称整体性能提升。
+
+证据标识：`prefill-fixed128-20261009-b2`、`prefill-fixed512-20261009-b`、`prefill-adaptive-20261009-b`。固定 128 的原 b run 在执行中骤降并出现 26 次超时，作为诊断样本保留，排除整份 run 后同配置重跑为 b2；不是删除慢请求后重算。首轮 a 允许 EOS 提前结束，协议不同，不与 b 混合统计。动态 b 与固定 128 b2 仍各有约半秒的早期离散，根因未定位；每个统一协议只有一次有效独立对照，尚不能形成稳定性能结论。
+
+本次原生阻挡主要来自请求槽，没有观察到 KV 预算阻挡。free 接近零时仍可能有大量 evictable 缓存；本轮未修改 allocator、eviction 或取消/超时回收逻辑。

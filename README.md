@@ -268,6 +268,7 @@ SGLang execution requires Linux or WSL2. The repository itself can still be edit
 - The default quantization benchmark runs requests sequentially. The separate BF16 scheduling baseline supports concurrent arrival-trace replay; see [the user guide](docs/guide.md#并发调度基准bf16). Neither synthetic workload establishes production-scale performance.
 - Scheduling gauges are sampled. An optional instrumented engine records prepared Prefill budgets and native admission-stop branches; these host events do not measure GPU execution duration. Cache eviction counts remain unavailable.
 - The adaptive Prefill experiment keeps LPM sorting fixed and compares per-iteration budgets with fixed chunks under phased traffic. It is disabled by default and does not imply a measured performance improvement; see [the user guide](docs/guide.md#动态-prefill-预算实验).
+- The initial fixed-output study completed 60 requests per case. Adaptive mode reduced low-load long-input TTFT relative to fixed 128, while its overall tail metrics were worse than fixed 512; it remains opt-in.
 - `lpm-aging` is an experimental source patch for SGLang 0.5.3. Its fairness and throughput tradeoffs depend on load and cache state; quality and deployment suitability have not been evaluated.
 
 ## Project structure
