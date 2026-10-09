@@ -580,3 +580,38 @@ python -m quantassay.scheduling \
 `--cache-start` 默认 `cold`；`warm-shared` 在清缓存后额外发送一个共享长前缀请求（输出上限 16 token），保存 `cache-prime.jsonl`，响应完成后等待 0.2 秒再开始计时。实际缓存启动协议进入负载指纹，输入/到达记录另有 `traffic_fingerprint`，不能混比冷/暖缓存结果。该预置请求不计入吞吐和延迟统计。
 
 `--aging-threshold-ms` 默认 1000，通过服务进程的 `SGLANG_LPM_MAX_WAIT_MS` 设置，进入 run 指纹。日志与结果分别记录补偿策略是否加载、是否真的遇到超阈值队列。结果包含各请求组排队时间的 p50/p95/p99/max；需要同时考察被补偿请求与共享前缀请求的代价，以及总体吞吐。
+
+### 动态 Prefill 预算实验
+
+此实验使用独立的 SGLang 0.5.3 源码分支。在每轮组批前，根据活跃 Decode 请求数选择 chunk 总预算：0–1 个使用上限，2 个使用中间预算，3 个及以上使用最小预算。原生 PrefillAdder 会扣除 Decode token；KV、请求槽约束和 LPM 排序仍由原生路径处理。新开关默认关闭，需要显式选择 `--policy lpm` 来固定本轮排序策略。
+
+把包含 `sglang/` 包的源码目录设置为 `$ENGINE`，模型快照与 revision 设置为 `$SNAP`、`$REV`。固定 128、固定 512 和动态 128–512 三组采用同一源码和 trace，并依次运行：
+
+```bash
+common=(--model-dir "$SNAP" --revision "$REV" --policy lpm
+  --engine-source "$ENGINE" --context-length 1024
+  --max-running-requests 4 --cuda-graph-max-bs 4 --mem-fraction-static 0.8
+  --enable-mixed-chunk --trace-prefill-budgets
+  --prefix-profile unique --short-input-tokens 64 --long-input-tokens 512
+  --output-budgets 64 128 192 --requests 60 --arrival-mode phased --phase-rates 1 12 1
+  --warmup-requests 8 --warmup-concurrency 4 --warmup-output-tokens 64)
+
+python -m quantassay.scheduling "${common[@]}" \
+  --run-dir "$HOME/quantassay-runs/prefill-fixed128-01" --chunked-prefill-size 128
+
+trace="$HOME/quantassay-runs/prefill-fixed128-01/workload.json"
+python -m quantassay.scheduling "${common[@]}" --trace-file "$trace" \
+  --run-dir "$HOME/quantassay-runs/prefill-fixed512-01" --chunked-prefill-size 512
+
+python -m quantassay.scheduling "${common[@]}" --trace-file "$trace" \
+  --run-dir "$HOME/quantassay-runs/prefill-adaptive-01" --chunked-prefill-size 512 \
+  --adaptive-prefill --adaptive-prefill-min-tokens 128 --adaptive-prefill-mid-tokens 256
+```
+
+参数默认值保持原有负载：`--prefix-profile mixed`、短/长输入目标 64/320、输出预算 32/64/96、`--arrival-mode fixed`、`--request-rate 16`。`phased` 将请求等分为三阶段，到达率默认 1/12/1 请求每秒；请求数必须能被 3 整除。生成输入保存实际 token 数，长度目标不替代真实统计。重放时从 trace 恢复生成参数、到达阶段和输入，不能混用不同负载。
+
+预热默认 3 请求、并发 1、输出上限 16；本例改为 8 请求、并发 4、输出上限 64，覆盖 mixed chunk 形状，完成后清空缓存再计时。所有预热记录保存在 `warmup.jsonl`。
+
+`prefill-events.jsonl` 保存源码事件及服务日志行号，区分预热和计时请求。`scheduling-result.json` 报告实际预算直方图、Decode 压力、组批 token 数、停止原因和 KV token 范围。free 与 evictable 分开记录；后者并非已经空闲的显存。连续相同阻挡状态会去重，事件数不是失败请求数；实际 eviction 数仍为 unavailable。
+
+报告同时提供按到达阶段归类的请求 TTFT/TPOT 和各计划时间窗口内的 ITL。窗口 ITL 包含前阶段积压请求，按后一 chunk 的到达时间归类；阶段标签不能证明服务压力已下降。先确认源码观测确实出现多种动态预算，再判断延迟与吞吐的取舍。这些事件记录的是主机侧组批准备，不能当成 GPU 执行耗时。一次对照不能证明稳定收益。

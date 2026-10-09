@@ -41,9 +41,28 @@ def arrival_offsets(count: int, *, mode: str, rate: float, seed: int) -> list[fl
 
 
 def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
-                seed: int, context_length: int) -> dict[str, Any]:
-    """Materialize 60% shared-long, 20% unique-long and 20% unique-short."""
-    offsets = arrival_offsets(count, mode=mode, rate=rate, seed=seed)
+                seed: int, context_length: int, prefix_profile: str = "mixed",
+                short_input_tokens: int = 64, long_input_tokens: int = 320,
+                output_budgets: tuple[int, ...] = (32, 64, 96),
+                phase_rates: tuple[float, ...] = (1, 12, 1)) -> dict[str, Any]:
+    """Materialize token inputs and open-loop arrivals before starting a server."""
+    if prefix_profile not in ("mixed", "unique"):
+        raise ValueError("prefix profile must be mixed or unique")
+    if not 0 < short_input_tokens <= long_input_tokens or not output_budgets or min(output_budgets) < 1:
+        raise ValueError("input lengths and output budgets must be positive")
+    phases = []
+    if mode == "phased":
+        if len(phase_rates) != 3 or count % 3 or any(not math.isfinite(r) or r <= 0 for r in phase_rates):
+            raise ValueError("phased arrivals require three positive rates and a count divisible by three")
+        offsets, start = [], 0.0
+        for index, phase_rate in enumerate(phase_rates):
+            end = start + (count // 3) / phase_rate
+            phases.append({"name": f"phase-{index + 1}", "rate": phase_rate,
+                           "start_seconds": start, "end_seconds": end})
+            offsets.extend(start + i / phase_rate for i in range(count // 3))
+            start = end
+    else:
+        offsets = arrival_offsets(count, mode=mode, rate=rate, seed=seed)
     rng = random.Random(seed)
     empty = tokenizer.apply_chat_template(
         [{"role": "user", "content": ""}], tokenize=True,
@@ -51,11 +70,14 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
     )
     requests = []
     for i, offset in enumerate(offsets):
-        group = "unique-long" if i % 5 == 0 else (
-            "unique-short" if i % 5 == 1 else "shared-long"
-        )
-        target = 64 if group == "unique-short" else 320
-        cap = (32, 64, 96)[i % 3]
+        if prefix_profile == "unique":
+            group = "unique-long" if i % 2 == 0 else "unique-short"
+        else:
+            group = "unique-long" if i % 5 == 0 else (
+                "unique-short" if i % 5 == 1 else "shared-long"
+            )
+        target = short_input_tokens if group == "unique-short" else long_input_tokens
+        cap = output_budgets[i % len(output_budgets)]
         identity = "shared handbook" if group == "shared-long" else (
             f"private case {rng.getrandbits(128):032x}"
         )
@@ -66,7 +88,7 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
         budget = target - len(empty) - len(tokenizer.encode(suffix, add_special_tokens=False))
         if budget < 1:
             raise ValueError("chat template does not fit the short prompt budget")
-        prefix_ids = tokenizer.encode(prefix * 40, add_special_tokens=False)
+        prefix_ids = tokenizer.encode(prefix * max(40, (target + 9) // 10), add_special_tokens=False)
         text = tokenizer.decode(prefix_ids[:budget]) + suffix
         ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": text}], tokenize=True,
@@ -79,11 +101,15 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
             "arrival_seconds": offset, "text": text, "input_ids": ids,
             "input_tokens": len(ids), "input_sha256": sha256_of(ids),
             "max_new_tokens": cap,
+            "arrival_phase": phases[i // (count // 3)]["name"] if phases else "steady",
         })
     trace = {
         "schema_version": 1, "seed": seed, "arrival_mode": mode,
         "request_rate": rate, "thinking_disabled": True, "temperature": 0,
         "cache_policy": "cold_start_after_warmup_then_prefix_reuse",
+        "generation": {"prefix_profile": prefix_profile, "short_input_tokens": short_input_tokens,
+                       "long_input_tokens": long_input_tokens, "output_budgets": list(output_budgets)},
+        "arrival_phases": phases,
         "requests": requests,
     }
     trace["fingerprint"] = sha256_of(trace)
@@ -121,6 +147,21 @@ def validate_trace(trace: dict[str, Any], *, context_length: int) -> None:
         previous = offset
     if len(requests) < 5:
         raise ValueError("replay trace must contain at least five requests")
+    phases = trace.get("arrival_phases", [])
+    if phases:
+        names = set()
+        previous_end = 0.0
+        for phase in phases:
+            start, end, rate = phase["start_seconds"], phase["end_seconds"], phase["rate"]
+            if (phase["name"] in names or not all(math.isfinite(v) for v in (start, end, rate))
+                    or start != previous_end or end <= start or rate <= 0):
+                raise ValueError("replay arrival phases must be ordered, contiguous and finite")
+            names.add(phase["name"])
+            previous_end = end
+        for request in requests:
+            phase = next((p for p in phases if p["name"] == request.get("arrival_phase")), None)
+            if phase is None or not phase["start_seconds"] <= request["arrival_seconds"] < phase["end_seconds"]:
+                raise ValueError("replay request must belong to its planned arrival phase")
 
 
 def native_events(lines: Iterable[bytes], meta: dict[str, Any]) -> Iterable[bytes]:
@@ -163,12 +204,17 @@ def send_request(base_url: str, request: dict[str, Any], *, origin: float,
         },
     }
     meta: dict[str, Any] = {}
+    chunk_clocks = []
+    def receive_clock():
+        now = time.monotonic()
+        chunk_clocks.append(now - origin)
+        return now
     lines = None
     try:
         lines = opener(f"{base_url}/generate", payload, timeout)
         record = record_from_stream(
             request["request_id"], native_events(lines, meta),
-            sent_at=sent, input_tokens=request["input_tokens"],
+            sent_at=sent, input_tokens=request["input_tokens"], clock_fn=receive_clock,
         )
         if record.status is RequestStatus.OK and (
             meta.get("id") != request["request_id"]
@@ -189,12 +235,15 @@ def send_request(base_url: str, request: dict[str, Any], *, origin: float,
     ended = time.monotonic()
     return {
         "request_id": request["request_id"], "group": request["group"],
+        "arrival_phase": request.get("arrival_phase", "steady"),
         "input_sha256": request["input_sha256"],
         "max_new_tokens": request["max_new_tokens"],
         "scheduled_arrival_seconds": request["arrival_seconds"],
         "sent_seconds": sent - origin, "completed_seconds": ended - origin,
         "dispatch_lag_ms": max(0, (sent - origin - request["arrival_seconds"]) * 1000),
         "arrival_to_completion_ms": (ended - origin - request["arrival_seconds"]) * 1000,
+        # The evaluator's final clock call marks stream closure, not a chunk.
+        "output_chunk_arrival_seconds": chunk_clocks[:-1] if record.status is RequestStatus.OK else [],
         "server_meta": meta, "record": record.model_dump(mode="json"),
     }
 
@@ -319,6 +368,9 @@ def run_trace(base_url: str, trace: dict[str, Any], output_dir: Path, *,
                                  records_path=str(path), sglang_version="0.5.3")
     return {"status": "succeeded" if all(r.status is RequestStatus.OK for r in records) else "failed",
             "summary": serving.model_dump(mode="json"), "wall_seconds": wall,
+            "origin_monotonic_seconds": origin,
+            "clock_id": time.get_clock_info("monotonic").implementation,
+            "arrival_phases": trace.get("arrival_phases", []),
             "metrics_origin_offset_seconds": sampler.started - origin,
             "client_concurrency": concurrency, "metrics": sampler.summary(), "rows": rows}
 
@@ -346,6 +398,25 @@ def distribution(values: list[float]) -> dict[str, Any]:
                for label, q in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))}}
 
 
+def summarize_rows(selected: list[dict[str, Any]]) -> dict[str, Any]:
+    ok = [r for r in selected if r["record"]["status"] == "ok"]
+    fields = {
+        "ttft_ms": [r["record"]["ttft_ms"] for r in ok],
+        "e2e_ms": [r["record"]["e2e_latency_ms"] for r in ok],
+        "tpot_ms": [RequestRecord.model_validate(r["record"]).tpot_ms for r in ok],
+        "itl_ms": [gap for r in ok for gap in r["record"]["itl_ms"]],
+        "server_queue_ms": [r["server_queue_ms"] for r in ok if r.get("server_queue_ms") is not None],
+        "dispatch_lag_ms": [r["dispatch_lag_ms"] for r in selected],
+        "arrival_to_completion_ms": [r["arrival_to_completion_ms"] for r in ok],
+        "output_tokens": [r["record"]["output_tokens"] for r in ok],
+    }
+    return {"requests": len(selected), "requests_ok": len(ok),
+            "cached_tokens": sum(r["server_meta"].get("cached_tokens", 0) for r in ok),
+            "prompt_tokens": sum(r["record"]["input_tokens"] for r in ok),
+            "distributions": {key: distribution([v for v in vals if v is not None])
+                              for key, vals in fields.items()}}
+
+
 def finalize_result(result: dict[str, Any], log_path: Path, output_dir: Path) -> dict[str, Any]:
     times = parse_request_times(log_path)
     rows = result.pop("rows")
@@ -356,29 +427,30 @@ def finalize_result(result: dict[str, Any], log_path: Path, output_dir: Path) ->
         append_jsonl(output_dir / "scheduler-requests.jsonl", row)
     for group in ("overall", "shared-long", "unique-long", "unique-short"):
         selected = rows if group == "overall" else [r for r in rows if r["group"] == group]
-        ok = [r for r in selected if r["record"]["status"] == "ok"]
-        fields = {
-            "ttft_ms": [r["record"]["ttft_ms"] for r in ok],
-            "e2e_ms": [r["record"]["e2e_latency_ms"] for r in ok],
-            "tpot_ms": [RequestRecord.model_validate(r["record"]).tpot_ms for r in ok],
-            "itl_ms": [gap for r in ok for gap in r["record"]["itl_ms"]],
-            "server_queue_ms": [r["server_queue_ms"] for r in ok if r.get("server_queue_ms") is not None],
-            "dispatch_lag_ms": [r["dispatch_lag_ms"] for r in selected],
-            "arrival_to_completion_ms": [r["arrival_to_completion_ms"] for r in ok],
-        }
-        groups[group] = {"requests": len(selected), "requests_ok": len(ok),
-                         "cached_tokens": sum(r["server_meta"].get("cached_tokens", 0) for r in ok),
-                         "prompt_tokens": sum(r["record"]["input_tokens"] for r in ok),
-                         "distributions": {key: distribution([v for v in vals if v is not None])
-                                           for key, vals in fields.items()}}
+        groups[group] = summarize_rows(selected)
     result["groups"] = groups
+    from quantassay.serving.prefill import collect_prefill_evidence
+    result["prefill_observation"] = collect_prefill_evidence(result, rows, log_path, output_dir)
+    result["phases"] = {}
+    for phase in result.get("arrival_phases", []):
+        selected = [r for r in rows if r.get("arrival_phase") == phase["name"]]
+        window_gaps = [gap for r in rows if r["record"]["status"] == "ok"
+                       for end, gap in zip(r.get("output_chunk_arrival_seconds", [])[1:], r["record"]["itl_ms"])
+                       if phase["start_seconds"] <= end < phase["end_seconds"]]
+        result["phases"][phase["name"]] = {
+            "planned_arrivals": phase, "arrival_cohort": summarize_rows(selected),
+            "window_itl_ms": distribution(window_gaps),
+            "window_itl_scope": "all requests; gap assigned by later chunk arrival, including earlier backlog",
+            "groups": {g: summarize_rows([r for r in selected if r["group"] == g])
+                       for g in ("shared-long", "unique-long", "unique-short")},
+        }
     result["queue_time_coverage"] = sum(r.get("server_queue_ms") is not None for r in rows)
     result["client_dispatch_delayed"] = any(r["dispatch_lag_ms"] > 25 for r in rows)
     result["limitations"] = [
         "ITL measures streamed output chunks, which may contain multiple tokens.",
         "Queue time is native scheduler wait-to-first-forward, excluding client/network time.",
         "Native queue-time logs are rounded; sub-millisecond values can be coarse.",
-        "Gauge sampling is not a complete GPU batch trace; eviction/admission counts are unavailable.",
+        "Gauge sampling and prepared-prefill events do not measure GPU execution duration; eviction counts are unavailable.",
         "These are synthetic BF16 workloads; quality and quantization benefits are not evaluated.",
         "One run per policy does not establish a stable performance improvement.",
     ]
@@ -397,9 +469,22 @@ def finalize_result(result: dict[str, Any], log_path: Path, output_dir: Path) ->
                      f"{dist['ttft_ms'].get('p50', 'unavailable')} | "
                      f"{dist['server_queue_ms'].get('p50', 'unavailable')} | "
                      f"{data['cached_tokens']} / {data['prompt_tokens']} |")
+    if result["phases"]:
+        lines.extend(["", "| Arrival phase | Success | TTFT p50 ms | Window ITL p95 ms |",
+                      "|---|---:|---:|---:|"])
+        for name, data in result["phases"].items():
+            cohort = data["arrival_cohort"]
+            lines.append(f"| {name} | {cohort['requests_ok']}/{cohort['requests']} | "
+                         f"{cohort['distributions']['ttft_ms'].get('p50', 'unavailable')} | "
+                         f"{data['window_itl_ms'].get('p95', 'unavailable')} |")
+    prefill = result["prefill_observation"]
+    lines.extend(["", f"Prefill observation: {prefill['status']}. "
+                  f"Prepared budget histogram: {prefill.get('prepared_budget_histogram', {})}.",
+                  "KV free tokens and evictable tokens are reported separately; admission events are not failed requests."])
     lines.extend(["", f"Client dispatch delayed >25 ms: {result['client_dispatch_delayed']}.", "",
                   "Evidence: workload.json, requests.jsonl, scheduler-requests.jsonl, "
-                  "scheduler-metrics.jsonl, logs/server.log, manifest.json, scheduling-result.json.", ""])
+                  "scheduler-metrics.jsonl, prefill-events.jsonl (if instrumented), logs/server.log, "
+                  "manifest.json, scheduling-result.json.", ""])
     lines.extend("- " + limitation for limitation in result["limitations"])
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return result

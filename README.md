@@ -266,7 +266,8 @@ SGLang execution requires Linux or WSL2. The repository itself can still be edit
 - Serving measurements can show run-to-run variance, especially on small consumer GPUs.
 - ITL is derived from streamed response chunks. A streamed chunk is not guaranteed to correspond to exactly one tokenizer token.
 - The default quantization benchmark runs requests sequentially. The separate BF16 scheduling baseline supports concurrent arrival-trace replay; see [the user guide](docs/guide.md#并发调度基准bf16). Neither synthetic workload establishes production-scale performance.
-- Scheduling gauges are sampled, rather than a complete trace of every GPU batch. Cache eviction counts and KV admission-block counts are currently unavailable.
+- Scheduling gauges are sampled. An optional instrumented engine records prepared Prefill budgets and native admission-stop branches; these host events do not measure GPU execution duration. Cache eviction counts remain unavailable.
+- The adaptive Prefill experiment keeps LPM sorting fixed and compares per-iteration budgets with fixed chunks under phased traffic. It is disabled by default and does not imply a measured performance improvement; see [the user guide](docs/guide.md#动态-prefill-预算实验).
 - `lpm-aging` is an experimental source patch for SGLang 0.5.3. Its fairness and throughput tradeoffs depend on load and cache state; quality and deployment suitability have not been evaluated.
 
 ## Project structure
@@ -281,6 +282,7 @@ src/quantassay/
 ├── serving/
 │   ├── benchmark.py
 │   ├── evaluator.py
+│   ├── prefill.py    source budget events and KV observations
 │   ├── scheduling.py  concurrent replay and native scheduler evidence
 │   └── workload.py
 ├── gating.py       pipeline orchestration

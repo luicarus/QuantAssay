@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from quantassay.contracts import MODEL_ID, sha256_of
@@ -65,13 +66,17 @@ def flush_idle_cache(base_url: str, *, timeout: float = 5) -> int:
 def engine_source_hashes() -> dict[str, str]:
     """Version strings alone do not identify a locally modified engine."""
     package = Path(importlib.util.find_spec("sglang").origin).parent
-    return {
+    hashes = {
         rel: file_sha256(package / "srt" / rel)
         for rel in ("managers/scheduler.py", "managers/schedule_policy.py",
                     "managers/schedule_batch.py", "mem_cache/radix_cache.py",
                     "mem_cache/allocator.py", "metrics/collector.py",
                     "managers/tokenizer_manager.py", "server_args.py")
     }
+    prefill = package / "srt/managers/prefill_budget.py"
+    if prefill.is_file():
+        hashes["managers/prefill_budget.py"] = file_sha256(prefill)
+    return hashes
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,8 +94,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, default=64,
                         help="client worker cap; excess arrivals retain measured dispatch lag")
     parser.add_argument("--max-running-requests", type=int, default=4)
-    parser.add_argument("--arrival-mode", choices=("burst", "fixed", "poisson"), default="fixed")
+    parser.add_argument("--arrival-mode", choices=("burst", "fixed", "poisson", "phased"), default="fixed")
     parser.add_argument("--request-rate", type=float, default=16)
+    parser.add_argument("--phase-rates", type=float, nargs=3, default=(1, 12, 1),
+                        help="three arrival rates for equal-sized phased request cohorts")
+    parser.add_argument("--prefix-profile", choices=("mixed", "unique"), default="mixed")
+    parser.add_argument("--short-input-tokens", type=int, default=64)
+    parser.add_argument("--long-input-tokens", type=int, default=320)
+    parser.add_argument("--output-budgets", type=int, nargs="+", default=(32, 64, 96))
+    parser.add_argument("--chunked-prefill-size", type=int,
+                        help="gross chunk budget, including native mixed decode reservation")
+    parser.add_argument("--enable-mixed-chunk", action="store_true")
+    parser.add_argument("--adaptive-prefill", action="store_true")
+    parser.add_argument("--adaptive-prefill-min-tokens", type=int, default=128)
+    parser.add_argument("--adaptive-prefill-mid-tokens", type=int, default=256)
+    parser.add_argument("--trace-prefill-budgets", action="store_true",
+                        help="requires the instrumented external engine source")
+    parser.add_argument("--warmup-requests", type=int, default=3)
+    parser.add_argument("--warmup-concurrency", type=int, default=1)
+    parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--context-length", type=int, default=512)
@@ -103,6 +125,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("aging threshold must be finite and positive")
     if args.policy == "lpm-aging" and not args.engine_source:
         parser.error("lpm-aging requires the patched isolated --engine-source")
+    if args.adaptive_prefill or args.trace_prefill_budgets:
+        if not args.engine_source or not (args.engine_source / "sglang/srt/managers/prefill_budget.py").is_file():
+            parser.error("adaptive Prefill and budget tracing require an instrumented --engine-source")
+    if args.adaptive_prefill and (not args.enable_mixed_chunk or not args.chunked_prefill_size
+                                or not 0 < args.adaptive_prefill_min_tokens <= args.adaptive_prefill_mid_tokens <= args.chunked_prefill_size):
+        parser.error("adaptive Prefill requires mixed chunks and 0 < min <= mid <= chunk size")
+    if args.chunked_prefill_size is not None and args.chunked_prefill_size < 1:
+        parser.error("chunk size must be positive")
+    if min(args.warmup_requests, args.warmup_concurrency, args.warmup_output_tokens,
+           args.max_running_requests) < 1:
+        parser.error("warmup settings and running request cap must be positive")
+    if args.prefix_profile == "unique" and args.cache_start == "warm-shared" and not args.trace_file:
+        parser.error("warm-shared cache start requires a workload with shared prefixes")
     try:
         engine_identity = configure_engine_source(args.engine_source)
     except ValueError as exc:
@@ -133,13 +168,26 @@ def main(argv: list[str] | None = None) -> int:
             trace = json.loads(args.trace_file.read_text(encoding="utf-8"))
             args.requests = len(trace.get("requests") or [])
             args.seed, args.arrival_mode, args.request_rate = trace["seed"], trace["arrival_mode"], trace["request_rate"]
+            generation = trace.get("generation", {})
+            for key in ("prefix_profile", "short_input_tokens", "long_input_tokens", "output_budgets"):
+                if key in generation:
+                    setattr(args, key, generation[key])
+            if trace.get("arrival_phases"):
+                args.phase_rates = [p["rate"] for p in trace["arrival_phases"]]
         else:
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
             trace = build_trace(tokenizer, count=args.requests, mode=args.arrival_mode,
                                 rate=args.request_rate, seed=args.seed,
-                                context_length=args.context_length)
+                                context_length=args.context_length,
+                                prefix_profile=args.prefix_profile,
+                                short_input_tokens=args.short_input_tokens,
+                                long_input_tokens=args.long_input_tokens,
+                                output_budgets=tuple(args.output_budgets),
+                                phase_rates=tuple(args.phase_rates))
         validate_trace(trace, context_length=args.context_length)
+        if args.cache_start == "warm-shared" and not any(r["group"] == "shared-long" for r in trace["requests"]):
+            raise ValueError("warm-shared cache start requires shared-prefix requests")
         replayed_fingerprint = trace["fingerprint"]
         trace["cache_policy"] = ("warm_shared_prefix_after_flush" if args.cache_start == "warm-shared"
                                  else "cold_start_after_warmup_then_prefix_reuse")
@@ -154,6 +202,15 @@ def main(argv: list[str] | None = None) -> int:
         command += ["--schedule-policy", args.policy, "--enable-metrics",
                     "--enable-cache-report", "--enable-request-time-stats-logging",
                     "--decode-log-interval", "10"]
+        if args.chunked_prefill_size is not None:
+            command += ["--chunked-prefill-size", str(args.chunked_prefill_size)]
+        if args.enable_mixed_chunk:
+            command += ["--enable-mixed-chunk"]
+        if args.adaptive_prefill:
+            command += ["--adaptive-prefill", "--adaptive-prefill-min-tokens", str(args.adaptive_prefill_min_tokens),
+                        "--adaptive-prefill-mid-tokens", str(args.adaptive_prefill_mid_tokens)]
+        if args.trace_prefill_budgets:
+            command += ["--trace-prefill-budgets"]
         config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
                   if key not in ("run_dir", "model_dir", "trace_file")}
         manifest = {
@@ -172,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                 "scheduling.py": file_sha256(Path(__file__)),
                 "serving/scheduling.py": file_sha256(Path(__file__).parent / "serving/scheduling.py"),
                 "serving/evaluator.py": file_sha256(Path(__file__).parent / "serving/evaluator.py"),
+                "serving/prefill.py": file_sha256(Path(__file__).parent / "serving/prefill.py"),
                 "runtime.py": file_sha256(Path(__file__).with_name("runtime.py")),
                 "engine.py": file_sha256(Path(__file__).with_name("engine.py")),
             },
@@ -193,10 +251,19 @@ def main(argv: list[str] | None = None) -> int:
         with server_session(command, port=args.port, model_id=MODEL_ID,
                             log_path=log_path) as session:
             wait_native_ready(session["base_url"])
-            for request in trace["requests"][:3]:
+            warmups = []
+            for request in trace["requests"][:args.warmup_requests]:
                 warmup = {**request, "request_id": "warmup-" + request["request_id"],
-                          "max_new_tokens": 16, "arrival_seconds": 0}
-                row = send_request(session["base_url"], warmup, origin=time.monotonic(), timeout=120)
+                          "max_new_tokens": args.warmup_output_tokens, "arrival_seconds": 0}
+                if len(warmup["input_ids"]) + args.warmup_output_tokens > args.context_length:
+                    raise ValueError("warmup output budget exceeds context length")
+                warmups.append(warmup)
+            warmup_origin = time.monotonic()
+            with ThreadPoolExecutor(max_workers=args.warmup_concurrency) as pool:
+                futures = [pool.submit(send_request, session["base_url"], warmup,
+                                       origin=warmup_origin, timeout=120) for warmup in warmups]
+                warmup_rows = [f.result() for f in futures]
+            for row in warmup_rows:
                 append_jsonl(args.run_dir / "warmup.jsonl", row)
                 if row["record"]["status"] != "ok":
                     raise RuntimeError("warmup failed; see warmup.jsonl")
@@ -217,7 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_trace(session["base_url"], trace, args.run_dir, concurrency=args.concurrency)
             result["cache_flush_attempts"] = flush_attempts
             result["cache_start"] = args.cache_start
-            result["warmup_requests"] = 3
+            result["warmup_requests"] = len(warmups)
+            result["warmup_concurrency"] = args.warmup_concurrency
             result["cache_prime_requests"] = int(args.cache_start == "warm-shared")
         session["gpu_settled_before_measure_mib"] = baseline
         session["gpu_settled"] = settled
@@ -236,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
         result = finalize_result(result, log_path, args.run_dir)
         observation_complete = (result["queue_time_coverage"] == args.requests
                                 and result["metrics"]["valid_samples"] > 0)
+        if args.trace_prefill_budgets:
+            observation_complete = observation_complete and result["prefill_observation"]["status"] == "ok"
         atomic_write_json(status_path, {"status": result["status"], "policy": args.policy,
                                         "fingerprint": manifest["fingerprint"],
                                         "observation_status": "complete" if observation_complete else "incomplete",
