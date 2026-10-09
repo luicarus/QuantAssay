@@ -44,7 +44,8 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
                 seed: int, context_length: int, prefix_profile: str = "mixed",
                 short_input_tokens: int = 64, long_input_tokens: int = 320,
                 output_budgets: tuple[int, ...] = (32, 64, 96),
-                phase_rates: tuple[float, ...] = (1, 12, 1)) -> dict[str, Any]:
+                phase_rates: tuple[float, ...] = (1, 12, 1),
+                ignore_eos: bool = False) -> dict[str, Any]:
     """Materialize token inputs and open-loop arrivals before starting a server."""
     if prefix_profile not in ("mixed", "unique"):
         raise ValueError("prefix profile must be mixed or unique")
@@ -101,11 +102,13 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
             "arrival_seconds": offset, "text": text, "input_ids": ids,
             "input_tokens": len(ids), "input_sha256": sha256_of(ids),
             "max_new_tokens": cap,
+            "ignore_eos": ignore_eos,
             "arrival_phase": phases[i // (count // 3)]["name"] if phases else "steady",
         })
     trace = {
         "schema_version": 1, "seed": seed, "arrival_mode": mode,
         "request_rate": rate, "thinking_disabled": True, "temperature": 0,
+        "ignore_eos": ignore_eos,
         "cache_policy": "cold_start_after_warmup_then_prefix_reuse",
         "generation": {"prefix_profile": prefix_profile, "short_input_tokens": short_input_tokens,
                        "long_input_tokens": long_input_tokens, "output_budgets": list(output_budgets)},
@@ -143,6 +146,8 @@ def validate_trace(trace: dict[str, Any], *, context_length: int) -> None:
             raise ValueError("replay request exceeds server context length")
         if request["group"] not in ("shared-long", "unique-long", "unique-short"):
             raise ValueError("unsupported replay request group")
+        if type(request.get("ignore_eos", False)) is not bool or request.get("ignore_eos", False) != trace.get("ignore_eos", False):
+            raise ValueError("replay EOS protocol must be a consistent boolean")
         seen.add(rid)
         previous = offset
     if len(requests) < 5:
@@ -201,6 +206,7 @@ def send_request(base_url: str, request: dict[str, Any], *, origin: float,
         "rid": request["request_id"], "input_ids": request["input_ids"],
         "stream": True, "sampling_params": {
             "temperature": 0, "max_new_tokens": request["max_new_tokens"],
+            "ignore_eos": request.get("ignore_eos", False),
         },
     }
     meta: dict[str, Any] = {}
@@ -222,6 +228,9 @@ def send_request(base_url: str, request: dict[str, Any], *, origin: float,
             or not meta.get("finish_reason") or not record.usage_available
         ):
             raise ValueError("native response lacks matching ID, token usage, or finish reason")
+        if (record.status is RequestStatus.OK and request.get("ignore_eos", False)
+                and record.output_tokens != request["max_new_tokens"]):
+            raise ValueError("fixed-output protocol did not produce the requested token count")
     except Exception as exc:
         record = RequestRecord(
             request_id=request["request_id"],
@@ -238,6 +247,7 @@ def send_request(base_url: str, request: dict[str, Any], *, origin: float,
         "arrival_phase": request.get("arrival_phase", "steady"),
         "input_sha256": request["input_sha256"],
         "max_new_tokens": request["max_new_tokens"],
+        "ignore_eos": request.get("ignore_eos", False),
         "scheduled_arrival_seconds": request["arrival_seconds"],
         "sent_seconds": sent - origin, "completed_seconds": ended - origin,
         "dispatch_lag_ms": max(0, (sent - origin - request["arrival_seconds"]) * 1000),
@@ -363,7 +373,7 @@ def run_trace(base_url: str, trace: dict[str, Any], output_dir: Path, *,
             sampler.stop()
     records = [RequestRecord.model_validate(row["record"]) for row in rows]
     serving = summarize_requests(records, side="bf16", wall_seconds=wall,
-                                 workload_id="scheduling-mixed-prefix",
+                                 workload_id="scheduling-" + trace.get("generation", {}).get("prefix_profile", "mixed"),
                                  workload_fingerprint=trace["fingerprint"],
                                  records_path=str(path), sglang_version="0.5.3")
     return {"status": "succeeded" if all(r.status is RequestStatus.OK for r in records) else "failed",

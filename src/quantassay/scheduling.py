@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--short-input-tokens", type=int, default=64)
     parser.add_argument("--long-input-tokens", type=int, default=320)
     parser.add_argument("--output-budgets", type=int, nargs="+", default=(32, 64, 96))
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="hold generated token counts at the requested caps for a fixed-work study")
     parser.add_argument("--chunked-prefill-size", type=int,
                         help="gross chunk budget, including native mixed decode reservation")
     parser.add_argument("--enable-mixed-chunk", action="store_true")
@@ -168,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             trace = json.loads(args.trace_file.read_text(encoding="utf-8"))
             args.requests = len(trace.get("requests") or [])
             args.seed, args.arrival_mode, args.request_rate = trace["seed"], trace["arrival_mode"], trace["request_rate"]
+            args.ignore_eos = trace.get("ignore_eos", False)
             generation = trace.get("generation", {})
             for key in ("prefix_profile", "short_input_tokens", "long_input_tokens", "output_budgets"):
                 if key in generation:
@@ -184,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                                 short_input_tokens=args.short_input_tokens,
                                 long_input_tokens=args.long_input_tokens,
                                 output_budgets=tuple(args.output_budgets),
-                                phase_rates=tuple(args.phase_rates))
+                                phase_rates=tuple(args.phase_rates), ignore_eos=args.ignore_eos)
         validate_trace(trace, context_length=args.context_length)
         if args.cache_start == "warm-shared" and not any(r["group"] == "shared-long" for r in trace["requests"]):
             raise ValueError("warm-shared cache start requires shared-prefix requests")
@@ -201,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         command += ["--schedule-policy", args.policy, "--enable-metrics",
                     "--enable-cache-report", "--enable-request-time-stats-logging",
-                    "--decode-log-interval", "10"]
+                    "--decode-log-interval", "10", "--random-seed", str(args.seed)]
         if args.chunked_prefill_size is not None:
             command += ["--chunked-prefill-size", str(args.chunked_prefill_size)]
         if args.enable_mixed_chunk:
@@ -286,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
             result["cache_start"] = args.cache_start
             result["warmup_requests"] = len(warmups)
             result["warmup_concurrency"] = args.warmup_concurrency
+            result["summary"]["warmup_requests"] = len(warmups)
+            for metric in result["summary"]["metrics"].values():
+                metric["run_id"] = args.run_dir.name
             result["cache_prime_requests"] = int(args.cache_start == "warm-shared")
         session["gpu_settled_before_measure_mib"] = baseline
         session["gpu_settled"] = settled
