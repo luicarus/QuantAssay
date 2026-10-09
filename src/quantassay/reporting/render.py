@@ -8,14 +8,10 @@ model output is untrusted text that must not break the report's structure.
 from __future__ import annotations
 
 import html
-import json
 from pathlib import Path
 from typing import Any
 
 from quantassay.contracts import ReportPaths, RegressionReport
-
-_ESCAPE_VARS = {"<", ">", "&", '"', "'"}
-
 
 def _esc(text: Any) -> str:
     return html.escape(str(text), quote=True)

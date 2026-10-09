@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from quantassay.experiments.store import atomic_write_json, file_sha256
-from quantassay.gating import MODEL_ID, verify_snapshot_layout
+from quantassay.contracts import MODEL_ID
+from quantassay.runtime import verify_snapshot_layout
 
 CALIBRATION_PROMPTS = (
     "Explain why a sorted list permits binary search in one sentence.",

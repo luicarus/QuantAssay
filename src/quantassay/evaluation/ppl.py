@@ -1,18 +1,8 @@
-"""NLL / perplexity aggregation — the numeric foundation of quality comparison.
+"""NLL/PPL metric helpers and paired bootstrap statistics.
 
-NOT part of the MVP: the MVP measures serving performance only and reports
-quality as ``not_evaluated`` (mvp-prd.md §1). This module is retained for the
-full PRD's quality expansion, and the rule below is fixed there
-(full-prd.md §4) and is **not** negotiable:
-
-* ``PPL = exp(sum_nll / token_count)`` over *valid target tokens only*.
-* Padding is excluded; the prediction target is shifted correctly.
-* Per-batch or per-shard PPL must never be averaged — that is a different,
-  wrong quantity. Only NLL sums and token counts are aggregated.
-* Without an alignable SGLang logprob path, PPL is ``unavailable``; a
-  Transformers-side PPL must never be substituted for a serving result.
-
-Everything here is pure and CPU-testable; no torch import is required.
+Quality comparisons use paired document resampling and pool NLL sums over valid
+target tokens: PPL = exp(sum_nll / token_count). Per-document PPLs are not averaged.
+These functions do not load a model; serving logprobs are collected in quality.py.
 """
 
 from __future__ import annotations

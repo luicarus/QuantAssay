@@ -15,12 +15,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from quantassay.contracts import sha256_of
+from quantassay.contracts import MODEL_ID, sha256_of
 from quantassay.engine import configure_engine_source
-from quantassay.experiments.store import atomic_write_json
-from quantassay.gating import (
-    MODEL_ID, _package_version, build_bf16_command, contention_blockers,
-    file_sha256, resource_blockers, resource_warnings, server_session,
+from quantassay.experiments.store import atomic_write_json, file_sha256
+from quantassay.runtime import (
+    _package_version, build_bf16_command, contention_blockers,
+    resource_blockers, resource_warnings, server_session,
     source_file_hashes, wait_for_clean_gpu,
 )
 from quantassay.serving.scheduling import (
@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
                 "scheduling.py": file_sha256(Path(__file__)),
                 "serving/scheduling.py": file_sha256(Path(__file__).parent / "serving/scheduling.py"),
                 "serving/evaluator.py": file_sha256(Path(__file__).parent / "serving/evaluator.py"),
-                "gating.py": file_sha256(Path(__file__).with_name("gating.py")),
+                "runtime.py": file_sha256(Path(__file__).with_name("runtime.py")),
                 "engine.py": file_sha256(Path(__file__).with_name("engine.py")),
             },
             "versions": {name: _package_version(name) for name in

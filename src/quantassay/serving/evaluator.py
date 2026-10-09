@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
 
 from quantassay.contracts import (
@@ -65,7 +65,9 @@ def iter_sse_payloads(lines: Iterable[bytes]) -> Iterator[dict[str, Any]]:
         if not line.startswith(b"data:"):
             continue
         data = line[5:].strip()
-        if not data or data == b"[DONE]":
+        if data == b"[DONE]":
+            return
+        if not data:
             continue
         try:
             yield json.loads(data)

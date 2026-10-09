@@ -15,19 +15,27 @@ from quantassay.contracts import (
     MetricRecord,
     MetricStatus,
     RegressionReport,
-    RequestRecord,
-    RequestStatus,
     ServingMetric,
     ServingSummary,
     SideStatus,
 )
 
-#: Metrics whose regression is computed as a plain ratio of aggregates.
-_THROUGHPUT_METRICS = {ServingMetric.TOKENS_PER_SEC, ServingMetric.REQUESTS_PER_SEC}
-
 #: Minimum fraction of requests that must succeed on both sides before a
 #: percentage is meaningful (mvp-prd.md §5: "成功请求覆盖率足够").
 MIN_SUCCESS_COVERAGE = 0.8
+
+
+def compare_serving_parameters(base: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Compare the recorded serving parameters for a paired quantization run."""
+    left = base.get("serving_parameters") or {}
+    right = candidate.get("serving_parameters") or {}
+    if not left or not right:
+        return ["serving parameters were not recorded for both sides"]
+    return [
+        f"{key}: {left.get(key)!r} != {right.get(key)!r}"
+        for key in sorted(set(left) | set(right))
+        if left.get(key) != right.get(key)
+    ]
 
 
 def _metric_or_none(summary: ServingSummary, metric: ServingMetric) -> MetricRecord | None:

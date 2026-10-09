@@ -1,32 +1,7 @@
-"""PPL scoring over the SGLang serving path (full-prd.md §4 layer 2).
+"""Score PPL from native SGLang prompt logprobs in non-overlapping windows.
 
-**This is not an MVP result.** The MVP measures serving performance and reports
-quality as ``not_evaluated``; this module belongs to the full PRD's quality
-layer (full-prd.md §8 layer 2).
-
-Why this uses SGLang rather than Transformers
----------------------------------------------
-The PRD is explicit: quality must be measured through the serving path, and a
-Transformers-side PPL must never be substituted for a serving result. Probing
-the locked SGLang 0.5.3 build showed the native ``/generate`` endpoint accepts
-``return_logprob=true, logprob_start_len=0`` and returns one logprob per prompt
-token with the first entry ``null`` (no context for the first token). That is
-exactly the correct teacher-forcing shift, so PPL is genuinely measurable here
-and no substitution is needed.
-
-Windowing
----------
-The server rejects prompts longer than ``context_length`` (measured: HTTP 400).
-Long documents are therefore scored in **non-overlapping windows**, and each
-window's first token has no in-window context — the standard sliding-window PPL
-approximation. Consequences that are recorded rather than hidden:
-
-* the first token of each window contributes no target (its logprob is null);
-* windows are counted and reported, so a reader can see the approximation;
-* both sides use *identical* windows, so the comparison stays paired.
-
-Aggregation follows the only correct rule: sum NLL and count valid tokens, then
-``PPL = exp(nll_sum / valid_tokens)``. Per-window PPLs are never averaged.
+The first token of each window has no target logprob. Rejected windows remain
+visible in the evidence. PPL is pooled from NLL sums and valid-token counts.
 """
 
 from __future__ import annotations
@@ -45,7 +20,6 @@ from quantassay.contracts import (
     SampleRecord,
 )
 from quantassay.experiments.store import atomic_write_json
-from quantassay.serving.evaluator import percentile
 
 #: Endpoint used for scoring. Native SGLang API: it is the only one that
 #: returns prompt-side logprobs (verified by probe on the locked version).

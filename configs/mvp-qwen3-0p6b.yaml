@@ -1,29 +1,20 @@
-# MVP experiment config: Qwen3-0.6B self-quantized GPTQ under the SGLang serving path.
-#
-# This file describes the *planned* experiment. It is not evidence that anything
-# has run: SGLang installation, BF16 serving, 0.6B self-quantization and the SGLang
-# GPTQ loading path are all unverified (docs/compatibility.md).
-#
-# The model identity below is validated, not merely defaulted: a config naming a
-# different model is rejected outright (mvp-prd.md §2). 0.6B is the minimum scale
-# that completes the full closed loop on this machine's 4 GB GPU; it is a
-# verification vehicle, not a production scale.
+# Qwen3-0.6B experiment specification and serving workload example.
+# `gating --workload-config` reads only the workload block. Model identity,
+# quantization method, quality corpus and serving options come from CLI arguments;
+# the other blocks describe the experiment and do not override the worker recipe.
 
 schema_version: "0.1.0"
 name: mvp-qwen3-0.6b
 
-# Fixed by the MVP. Changing it changes the entire comparison.
+# The current execution pipeline supports this model only.
 model_id: Qwen/Qwen3-0.6B
-# Resolved at first experiment and written back; must be a 40-char commit SHA.
-# The M0 gate rejects anything else, so null here means "not yet pinned".
+# Supply the immutable 40-character snapshot commit through --revision.
 model_revision: null
 tokenizer_id: null
-# BF16 by protocol: the baseline dtype is fixed, and FP16 would require a
-# matched baseline rebuild rather than a silent switch.
+# Baseline and quantization input weights use BF16.
 dtype: bf16
 
-# Qwen3 thinking mode is part of the protocol. The MVP fixes non-thinking so
-# output length stays controlled; enabling it creates a separate experiment.
+# The serving workload explicitly disables Qwen3 thinking.
 thinking_mode: disabled
 
 seed: 0
@@ -37,19 +28,18 @@ quant:
   weight_bits: 4
   activation_bits: 16
   group_size: 128
-  symmetric: false
-  targets: []
+  symmetric: true
+  targets:
+    - Linear
   ignore:
     - lm_head
-  # M0 feasibility probe size, not a published recipe. Four short samples
-  # demonstrate that quantization runs; they say nothing about quality.
+  # Four short samples check execution; this is not a representative study.
   calibration_samples: 4
   calibration_max_tokens: 128
   high_precision_layers: []
   backend_options: {}
 
-# The measured object. Both sides must run this exact workload; any change
-# produces a new fingerprint because it changes what the numbers mean.
+# Both comparison sides use this workload. Prompt hashes are filled by the loader.
 workload:
   workload_id: mvp-short-chat
   request_set_id: builtin-short-chat
@@ -67,8 +57,7 @@ workload:
   timeout_seconds: 120.0
   retry_policy: none
 
-# Calibration and serving data are kept apart; the MVP does not run quality
-# evaluation, so the PPL document counts are zero by design.
+# Quality scoring is configured separately by CLI arguments; --stage full runs it.
 data:
   source: builtin-calibration
   revision: null
@@ -86,14 +75,10 @@ budget:
   max_wall_time_minutes: 480
   max_artifact_bytes: 32212254720
 
-# Local view of the serving measurement budget; the authoritative object is
-# `workload`, which both sides must share exactly.
+# Descriptive defaults; the CLI reads serving measurement settings from workload.
 performance:
   batch_size: 1
   input_tokens: 128
   output_tokens: 64
   warmup_runs: 3
   measured_runs: 20
-
-# Out-of-MVP blocks (full-prd.md §8 layer 2) are intentionally absent: the MVP
-# measures serving performance only and reports quality as not_evaluated.

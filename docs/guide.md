@@ -425,7 +425,10 @@ python -m quantassay.reanalyze "$HOME/quantassay-runs/my-first-run"
 
 它从 `serving-*.jsonl` 复算指标，重写 `regressions.json`、`recommendations.json`、`report.md/html`。
 
-> 目前 `reanalyze` 只重建 serving 侧；质量侧来自 `quality-*.json`，不受影响。
+它自动识别 GPTQ 或 AWQ，并在两侧 `quality-*.json` 都存在时重新附加 PPL 对比。
+存在阶段记录时，先校验质量阶段的成功状态、结果校验和以及汇总一致性。
+若目录中同时存在两种方法的 benchmark，使用 `--quant-method gptq` 或
+`--quant-method awq` 指定候选。质量侧复用已有汇总，不重新请求模型。
 
 ---
 
