@@ -14,7 +14,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Sequence
 
 from quantassay.contracts import (
     SCHEMA_VERSION,
@@ -223,9 +223,3 @@ def prepare_data(
     manifest.notes.append(f"inputs_fingerprint={sha256_of(manifest_inputs)}")
 
     return PrepareResult(manifest=manifest, samples=samples)
-
-
-def iter_records(manifest: DatasetManifest, split: DataSplit | None = None) -> Iterator[SampleRecord]:
-    for record in manifest.samples:
-        if split is None or record.split is split:
-            yield record

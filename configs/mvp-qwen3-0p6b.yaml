@@ -1,50 +1,10 @@
-# Qwen3-0.6B experiment specification and serving workload example.
-# `gating --workload-config` reads only the workload block. Model identity,
-# quantization method, quality corpus and serving options come from CLI arguments;
-# the other blocks describe the experiment and do not override the worker recipe.
+# Serving workload for both sides of a QuantAssay comparison.
+# Request hashes are derived from the built-in prompts by the loader.
+# Model, quantization, corpus and engine settings are configured through the CLI.
 
-schema_version: "0.1.0"
-name: mvp-qwen3-0.6b
-
-# The current execution pipeline supports this model only.
-model_id: Qwen/Qwen3-0.6B
-# Supply the immutable 40-character snapshot commit through --revision.
-model_revision: null
-tokenizer_id: null
-# Baseline and quantization input weights use BF16.
-dtype: bf16
-
-# The serving workload explicitly disables Qwen3 thinking.
-thinking_mode: disabled
-
-seed: 0
-batch_size: 1
-smoke_max_tokens: 128
-max_tokens: 512
-
-quant:
-  algorithm: gptq
-  scheme: W4A16
-  weight_bits: 4
-  activation_bits: 16
-  group_size: 128
-  symmetric: true
-  targets:
-    - Linear
-  ignore:
-    - lm_head
-  # Four short samples check execution; this is not a representative study.
-  calibration_samples: 4
-  calibration_max_tokens: 128
-  high_precision_layers: []
-  backend_options: {}
-
-# Both comparison sides use this workload. Prompt hashes are filled by the loader.
 workload:
   workload_id: mvp-short-chat
   request_set_id: builtin-short-chat
-  request_hashes:
-    - unset:workload-not-yet-materialised
   thinking_mode: disabled
   input_tokens_target: 128
   max_new_tokens: 64
@@ -56,29 +16,3 @@ workload:
   cache_policy: disabled
   timeout_seconds: 120.0
   retry_policy: none
-
-# Quality scoring is configured separately by CLI arguments; --stage full runs it.
-data:
-  source: builtin-calibration
-  revision: null
-  language:
-    - en
-  calibration_samples: 4
-  dev_ppl_documents: 0
-  final_ppl_documents: 0
-  max_tokens: 512
-  smoke_max_tokens: 128
-
-budget:
-  max_trials: 2
-  max_gpu_hours: 20.0
-  max_wall_time_minutes: 480
-  max_artifact_bytes: 32212254720
-
-# Descriptive defaults; the CLI reads serving measurement settings from workload.
-performance:
-  batch_size: 1
-  input_tokens: 128
-  output_tokens: 64
-  warmup_runs: 3
-  measured_runs: 20

@@ -274,8 +274,9 @@ SGLang execution requires Linux or WSL2. The repository itself can still be edit
 ```text
 src/quantassay/
 ├── analysis/       comparison and regression analysis
+├── config/         serving workload YAML loading
 ├── evaluation/     corpus and perplexity evaluation
-├── experiments/    run artifacts and persistence
+├── experiments/    atomic evidence I/O and checksums
 ├── reporting/      Markdown / HTML reports
 ├── serving/
 │   ├── benchmark.py
@@ -283,6 +284,7 @@ src/quantassay/
 │   ├── scheduling.py  concurrent replay and native scheduler evidence
 │   └── workload.py
 ├── gating.py       pipeline orchestration
+├── runtime.py      shared SGLang process lifecycle and GPU observations
 ├── scheduling.py   BF16 scheduling experiment CLI
 ├── prepare_sglang.py  isolated SGLang source patch preparation
 └── quantize_worker.py

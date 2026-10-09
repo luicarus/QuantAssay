@@ -366,6 +366,9 @@ python -m quantassay.gating --run-dir "$HOME/quantassay-runs/awq-check" --quant-
 
 负载定义在 `configs/mvp-qwen3-0p6b.yaml` 的 `workload` 块：
 
+该 YAML 只配置 serving 工作负载，通过 `--workload-config` 传入。
+模型、量化方法、质量语料和引擎选择分别使用对应 CLI 参数配置。
+
 ```yaml
 workload:
   max_new_tokens: 256     # 加大这个，看差距是否仍然存在

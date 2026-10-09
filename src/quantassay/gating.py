@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quantassay.analysis.regression import compare_serving_parameters as compare_serving_parameters
+from quantassay.config import load_workload as load_workload
 from quantassay.contracts import (
     MODEL_ID,
     DataSplit,
@@ -36,7 +37,6 @@ from quantassay.evaluation.quality import score_documents
 from quantassay.experiments.store import StoreError, atomic_write_json, file_sha256, read_json
 from quantassay.reporting.pipeline import attach_quality, build_comparison_report, save_report
 from quantassay.serving.benchmark import benchmark, load_records
-from quantassay.serving.workload import build_request_set, request_set_hashes
 from quantassay.runtime import (
     DEFAULT_ATTENTION_BACKEND,
     DEFAULT_CUDA_GRAPH_MAX_BS,
@@ -450,16 +450,6 @@ def selected_quant_methods(args: Any) -> list[str]:
     return [requested]
 
 
-def stage_is_known(stage: str) -> bool:
-    """Whether ``--stage`` names a real stage (single stage or mode)."""
-    if stage in ("preflight", "bf16", "all", "full", "benchmark_bf16"):
-        return True
-    for method in SUPPORTED_QUANT_METHODS:
-        if stage in method_stage_names(method).values() or stage == f"benchmark_{method}":
-            return True
-    return False
-
-
 def verify_service_log(result: dict[str, Any]) -> bool:
     path = Path(result.get("log_path", ""))
     expected = result.get("log_sha256")
@@ -828,42 +818,6 @@ def _attach_quality_to_report(
     save_report(report, run_dir)
 
 
-def load_workload(config_path: Path | None) -> WorkloadSpec:
-    """Load the fixed workload, defaulting to the built-in request set.
-
-    The workload is part of the experiment fingerprint: a different request set
-    or timing window produces a different fingerprint and cannot be compared.
-    """
-    import yaml
-
-    requests = build_request_set()
-    hashes = request_set_hashes(requests)
-    if config_path is None:
-        return WorkloadSpec(
-            workload_id="mvp-short-chat",
-            request_set_id="builtin-short-chat",
-            request_hashes=hashes,
-            warmup_requests=3,
-            timed_requests=20,
-            max_new_tokens=64,
-        )
-    try:
-        document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise ProbeError(f"cannot read workload config {config_path}: {exc}") from exc
-    raw = (document or {}).get("workload")
-    if not isinstance(raw, dict):
-        raise ProbeError(f"{config_path} has no workload block")
-    raw = dict(raw)
-    # The request set is code-owned: a config cannot smuggle in different inputs.
-    raw["request_hashes"] = hashes
-    raw.setdefault("request_set_id", "builtin-short-chat")
-    try:
-        return WorkloadSpec(**raw)
-    except Exception as exc:
-        raise ProbeError(f"invalid workload in {config_path}: {exc}") from exc
-
-
 def run_quantization_process(
     model_dir: Path,
     revision: str,
@@ -1088,6 +1042,7 @@ def _fingerprint(
         "controller_sha256": file_sha256(Path(__file__)),
         "engine_selector_sha256": file_sha256(Path(__file__).with_name("engine.py")),
         "runtime_sha256": file_sha256(Path(__file__).with_name("runtime.py")),
+        "workload_loader_sha256": file_sha256(Path(__file__).parent / "config/schema.py"),
         "serving_evaluator_sha256": file_sha256(Path(__file__).parent / "serving/evaluator.py"),
         "quant_worker_sha256": file_sha256(Path(__file__).with_name("quantize_worker.py")),
         "source_files": hashes,

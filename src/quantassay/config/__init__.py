@@ -1,5 +1,5 @@
-"""Configuration schema, capability rules and normalization."""
+"""Serving workload configuration."""
 
-from quantassay.config.schema import ConfigError, dump_spec, load_spec, validate_spec
+from quantassay.config.schema import load_workload
 
-__all__ = ["ConfigError", "dump_spec", "load_spec", "validate_spec"]
+__all__ = ["load_workload"]

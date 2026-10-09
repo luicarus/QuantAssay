@@ -1,16 +1,7 @@
-"""Core data contracts shared by all quantassay modules.
+"""Persisted contracts for serving, quality, datasets and reports.
 
-Every type that is persisted or passed across a module boundary lives here.
-Modules must not define competing versions of these fields (see full-prd.md §3
-and mvp-prd.md §3).
-
-Design rules enforced by this module:
-
-* Missing metrics carry an explicit ``status``/``reason``; they are never
-  encoded as ``0``.
-* Anything that changes an experiment's meaning changes its fingerprint.
-* Status enums are closed sets so evidence levels cannot be silently upgraded.
-* The MVP model identity is fixed and validated, never defaulted into drift.
+Unavailable metrics carry a status and reason. Evidence formats and comparison
+fingerprints are shared by native and custom SGLang execution paths.
 """
 
 from __future__ import annotations
@@ -19,18 +10,13 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 
 SCHEMA_VERSION = "0.1.0"
-
-#: The MVP fixes this model. Serving regression is only meaningful when both
-#: sides descend from the same original checkpoint (mvp-prd.md §2).
-#: 0.6B is the minimum scale that completes the full closed loop on this
-#: machine's 4 GB GPU; it is a verification vehicle, not a production scale.
 MODEL_ID = "Qwen/Qwen3-0.6B"
-MODEL_REVISION_PATTERN = r"^[0-9a-f]{40}$"
 
 
 class ThinkingMode(str, Enum):
@@ -42,48 +28,6 @@ class ThinkingMode(str, Enum):
 
     DISABLED = "disabled"
     ENABLED = "enabled"
-
-
-# --------------------------------------------------------------------------
-# Enums: closed sets that encode the project's evidence discipline
-# --------------------------------------------------------------------------
-
-
-class StageName(str, Enum):
-    """Ordered pipeline stages of a `run` (mvp-prd.md §3)."""
-
-    DATA = "data"
-    BASELINE = "baseline"
-    QUANTIZE = "quantize"
-    EVALUATE = "evaluate"
-    TRACE = "trace"
-    INTERVENTION = "intervention"
-    ADVISE = "advise"
-    FINAL_EVAL = "final_eval"
-    REPORT = "report"
-
-
-STAGE_ORDER: tuple[StageName, ...] = (
-    StageName.DATA,
-    StageName.BASELINE,
-    StageName.QUANTIZE,
-    StageName.EVALUATE,
-    StageName.TRACE,
-    StageName.INTERVENTION,
-    StageName.ADVISE,
-    StageName.FINAL_EVAL,
-    StageName.REPORT,
-)
-
-
-class StageStatus(str, Enum):
-    """`exists on disk` is not `succeeded`; recovery reads this, not the filesystem."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    SKIPPED = "skipped"
 
 
 class MetricStatus(str, Enum):
@@ -140,11 +84,6 @@ class MetricDirection(str, Enum):
     NEUTRAL = "neutral"
 
 
-# --------------------------------------------------------------------------
-# Fingerprinting
-# --------------------------------------------------------------------------
-
-
 def canonical_json(value: Any) -> str:
     """Serialize deterministically so fingerprints are stable across runs."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
@@ -162,23 +101,6 @@ def sha256_text(text: str) -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-# --------------------------------------------------------------------------
-# Serving evaluation (SGLang path) - mvp-prd.md §4
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Serving evaluation (SGLang path) — mvp-prd.md §4
-# --------------------------------------------------------------------------
-
-
-
-
-# --------------------------------------------------------------------------
-# Report paths
-# --------------------------------------------------------------------------
 
 
 class ReportPaths(BaseModel):
@@ -208,8 +130,6 @@ class ServingMetric(str, Enum):
     E2E_LATENCY = "e2e_latency_ms"
 
 
-#: Direction of improvement. Lower latency is better; higher throughput is better.
-#: Reporting a "throughput improvement" with a latency sign is a defect.
 SERVING_METRIC_DIRECTION: dict[ServingMetric, MetricDirection] = {
     ServingMetric.TTFT: MetricDirection.LOWER_IS_BETTER,
     ServingMetric.ITL: MetricDirection.LOWER_IS_BETTER,
@@ -219,6 +139,7 @@ SERVING_METRIC_DIRECTION: dict[ServingMetric, MetricDirection] = {
     ServingMetric.REQUESTS_PER_SEC: MetricDirection.HIGHER_IS_BETTER,
     ServingMetric.TOTAL_TOKENS_PER_SEC: MetricDirection.HIGHER_IS_BETTER,
 }
+
 
 SERVING_METRIC_UNITS: dict[ServingMetric, str] = {
     ServingMetric.TTFT: "ms",
@@ -230,7 +151,7 @@ SERVING_METRIC_UNITS: dict[ServingMetric, str] = {
     ServingMetric.TOTAL_TOKENS_PER_SEC: "total_tokens/s",
 }
 
-#: Only these four are MVP deliverables.
+
 MVP_SERVING_METRICS: tuple[ServingMetric, ...] = (
     ServingMetric.TTFT,
     ServingMetric.TPOT,
@@ -238,8 +159,7 @@ MVP_SERVING_METRICS: tuple[ServingMetric, ...] = (
     ServingMetric.TOKENS_PER_SEC,
 )
 
-#: Reason codes for a request that did not produce a usable measurement.
-#: A failed request is never recorded as a zero-latency success.
+
 REQUEST_FAILURE_REASONS: dict[str, str] = {
     "no_first_token": "stream ended before any output token arrived",
     "timeout": "request exceeded the configured timeout",
@@ -306,29 +226,6 @@ class WorkloadSpec(BaseModel):
         payload.pop("request_hashes", None)
         payload["request_set_digest"] = sha256_of(self.request_hashes)
         return sha256_of(payload)
-
-
-def default_mvp_workload() -> "WorkloadSpec":
-    """A minimal, explicitly-declared MVP workload.
-
-    Deliberately small and non-thinking: the first local GPU session is a feasibility
-    gate, not a performance campaign. Real request hashes are supplied by the
-    evaluator once the request set is fixed; the placeholder keeps the object
-    valid so a run cannot silently proceed with no declared load.
-    """
-    return WorkloadSpec(
-        workload_id="mvp-short-chat",
-        request_set_id="builtin-short-chat",
-        request_hashes=["unset:workload-not-yet-materialised"],
-        thinking_mode=ThinkingMode.DISABLED,
-        input_tokens_target=128,
-        max_new_tokens=64,
-        temperature=0.0,
-        concurrency=1,
-        warmup_requests=3,
-        timed_requests=20,
-        cache_policy="disabled",
-    )
 
 
 class RequestRecord(BaseModel):
@@ -505,11 +402,6 @@ class RegressionReport(BaseModel):
         return self.quality_status == "not_evaluated"
 
 
-# --------------------------------------------------------------------------
-# Quality evaluation (full-prd.md §4 layer 2 — NOT an MVP result)
-# --------------------------------------------------------------------------
-
-
 class QualityStatus(str, Enum):
     """How much the quality comparison can actually claim."""
 
@@ -607,51 +499,6 @@ class QualityComparison(BaseModel):
         return self
 
 
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-
-class QuantConfig(BaseModel):
-    """How to quantize. Mirrors the recipe the backend actually applied."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    algorithm: str = "gptq"
-    scheme: str = "W4A16"
-    weight_bits: int = Field(default=4, ge=2, le=16)
-    activation_bits: int = Field(default=16, ge=2, le=16)
-    group_size: int = Field(default=128, gt=0)
-    symmetric: bool = False
-    targets: list[str] = Field(default_factory=list)
-    ignore: list[str] = Field(default_factory=list)
-    calibration_samples: int = Field(default=64, ge=0)
-    calibration_max_tokens: int = Field(default=512, gt=0)
-    calibration_split_hash: str | None = None
-    backend_options: dict[str, Any] = Field(default_factory=dict)
-    # Layers kept at higher precision, e.g. ["model.layers.18"].
-    high_precision_layers: list[str] = Field(default_factory=list)
-
-    @field_validator("targets", "ignore", "high_precision_layers")
-    @classmethod
-    def _no_blank_entries(cls, v: list[str]) -> list[str]:
-        if any(not item.strip() for item in v):
-            raise ValueError("module patterns must not be blank")
-        return v
-
-    @model_validator(mode="after")
-    def _no_target_ignore_overlap(self) -> "QuantConfig":
-        overlap = set(self.targets) & set(self.ignore)
-        if overlap:
-            raise ValueError(f"targets and ignore overlap: {sorted(overlap)}")
-        exempt = set(self.high_precision_layers) & set(self.ignore)
-        if exempt:
-            raise ValueError(
-                f"a layer cannot be both high-precision and ignored: {sorted(exempt)}"
-            )
-        return self
-
-
 class DataConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -663,98 +510,6 @@ class DataConfig(BaseModel):
     final_ppl_documents: int = Field(default=128, ge=0)
     max_tokens: int = Field(default=512, gt=0)
     smoke_max_tokens: int = Field(default=128, gt=0)
-
-
-class BudgetConfig(BaseModel):
-    """Hard caps. Reaching a cap means "record what we have", never "retry forever"."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    max_trials: int = Field(default=8, ge=0)
-    max_gpu_hours: float = Field(default=20.0, gt=0)
-    max_wall_time_minutes: int = Field(default=480, gt=0)
-    max_artifact_bytes: int = Field(default=30 * 1024**3, gt=0)
-
-
-class PerformanceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    batch_size: int = Field(default=1, ge=1)
-    input_tokens: int = Field(default=128, gt=0)
-    output_tokens: int = Field(default=32, gt=0)
-    warmup_runs: int = Field(default=3, ge=0)
-    measured_runs: int = Field(default=10, ge=1)
-
-
-class ExperimentSpec(BaseModel):
-    """Validated experiment configuration. Any change here yields a new fingerprint."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: str = SCHEMA_VERSION
-    name: str = "mvp-qwen3-0.6b"
-    model_id: str = MODEL_ID
-    model_revision: str | None = None
-    tokenizer_id: str | None = None
-    dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
-    # Qwen3 thinking mode is part of the protocol: a run must state which mode it
-    # used, and the two modes are never one comparison (full-prd.md §2).
-    thinking_mode: ThinkingMode = ThinkingMode.DISABLED
-    seed: int = 0
-    batch_size: int = Field(default=1, ge=1)
-    smoke_max_tokens: int = Field(default=128, gt=0)
-    max_tokens: int = Field(default=512, gt=0)
-    quant: QuantConfig = Field(default_factory=QuantConfig)
-    data: DataConfig = Field(default_factory=DataConfig)
-    #: The MVP's measured object. Required: an experiment with no declared
-    #: workload has nothing to compare, and the two sides must share it exactly.
-    workload: WorkloadSpec = Field(default_factory=default_mvp_workload)
-    budget: BudgetConfig = Field(default_factory=BudgetConfig)
-    performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
-
-    @field_validator("model_id")
-    @classmethod
-    def _model_identity_is_fixed(cls, value: str) -> str:
-        """The MVP model is fixed by the PRD; a different id must fail, not drift."""
-        if value != MODEL_ID:
-            raise ValueError(
-                f"the MVP fixes the model to {MODEL_ID!r}; got {value!r}. "
-                "Changing the model changes the whole comparison and is not a "
-                "config-level decision (mvp-prd.md §2)."
-            )
-        return value
-
-    @model_validator(mode="after")
-    def _enforce_single_model_batch_one(self) -> "ExperimentSpec":
-        # full-prd.md §3: one service at a time on the single 4 GB card.
-        if self.batch_size != 1:
-            raise ValueError("MVP requires batch_size=1 (one model served at a time)")
-        if self.max_tokens < self.smoke_max_tokens:
-            raise ValueError("max_tokens must be >= smoke_max_tokens")
-        if self.dtype != "bf16":
-            raise ValueError(
-                "the baseline is BF16 by protocol; FP16 would require a matched "
-                "baseline rebuild and must not be switched silently (AGENTS.md §3)"
-            )
-        return self
-
-    @property
-    def tokenizer(self) -> str:
-        return self.tokenizer_id or self.model_id
-
-    @property
-    def enable_thinking(self) -> bool:
-        return self.thinking_mode is ThinkingMode.ENABLED
-
-    def config_fingerprint(self) -> str:
-        payload = self.model_dump(mode="json")
-        payload.pop("name", None)
-        return sha256_of(payload)
-
-
-# --------------------------------------------------------------------------
-# Data manifests
-# --------------------------------------------------------------------------
 
 
 class SampleRecord(BaseModel):
@@ -796,11 +551,6 @@ class DatasetManifest(BaseModel):
         return sha256_of(self.model_dump(mode="json"))
 
 
-# --------------------------------------------------------------------------
-# Metrics
-# --------------------------------------------------------------------------
-
-
 class MetricRecord(BaseModel):
     """A single measured value. No value -> a status explaining why."""
 
@@ -836,57 +586,6 @@ class MetricRecord(BaseModel):
         return cls(name=name, value=None, status=MetricStatus.UNAVAILABLE, reason=reason, **kw)
 
 
-class MetricBundle(BaseModel):
-    """Overall + grouped metrics for one artifact on one dataset."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: str = SCHEMA_VERSION
-    run_id: str = ""
-    overall: dict[str, MetricRecord] = Field(default_factory=dict)
-    slices: dict[str, dict[str, MetricRecord]] = Field(default_factory=dict)
-    samples_ref: str | None = None
-    notes: list[str] = Field(default_factory=list)
-
-    def require(self, name: str) -> MetricRecord:
-        if name not in self.overall:
-            raise KeyError(f"metric {name!r} missing from bundle")
-        return self.overall[name]
-
-
-# --------------------------------------------------------------------------
-# Artifacts, traces, interventions, recommendations
-# --------------------------------------------------------------------------
-
-
-class ModelArtifact(BaseModel):
-    """A loadable model product and the provenance needed to reproduce it."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    artifact_id: str
-    checkpoint_path: str
-    parent_model_id: str
-    parent_model_revision: str | None = None
-    parent_fingerprint: str | None = None
-    quant: QuantConfig | None = None
-    dtype: str = "bf16"
-    format: str = "hf"
-    run_mode: RunMode = RunMode.BF16
-    checksum: str | None = None
-    size_bytes: int | None = None
-    notes: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _quantized_requires_recipe(self) -> "ModelArtifact":
-        # A quantized artifact without its recipe cannot be reproduced or explained.
-        if self.format not in {"hf", "bf16"} and self.quant is None:
-            raise ValueError(
-                f"artifact {self.artifact_id!r}: format={self.format!r} requires a QuantConfig"
-            )
-        return self
-
-
 class Recommendation(BaseModel):
     """Advisory output. May only cite evidence that already exists.
 
@@ -918,137 +617,3 @@ class Recommendation(BaseModel):
         if self.status is EvidenceStatus.VALIDATED and not self.evidence_refs:
             raise ValueError(f"rule {self.rule_id!r}: VALIDATED requires evidence_refs")
         return self
-
-
-# --------------------------------------------------------------------------
-# Environment capability reporting
-# --------------------------------------------------------------------------
-
-
-class CapabilityReport(BaseModel):
-    """What a model x format x backend x GPU combination can actually do."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: str = SCHEMA_VERSION
-    gpu_name: str | None = None
-    gpu_total_memory_bytes: int | None = None
-    compute_capability: str | None = None
-    has_native_fp8: bool | None = None
-    image_tag: str | None = None
-    python_version: str | None = None
-    torch_version: str | None = None
-    cuda_version: str | None = None
-    driver_version: str | None = None
-    package_versions: dict[str, str] = Field(default_factory=dict)
-    capabilities: dict[str, str] = Field(default_factory=dict)
-    unsupported: dict[str, str] = Field(default_factory=dict)
-    not_tested: dict[str, str] = Field(default_factory=dict)
-    notes: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _unsupported_and_not_tested_are_distinct(self) -> "CapabilityReport":
-        overlap = set(self.unsupported) & set(self.not_tested)
-        if overlap:
-            raise ValueError(
-                f"entries marked both unsupported and not_tested: {sorted(overlap)}"
-            )
-        return self
-
-
-# --------------------------------------------------------------------------
-# Run manifest and stage state
-# --------------------------------------------------------------------------
-
-
-class StageRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    stage: StageName
-    status: StageStatus = StageStatus.PENDING
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-    attempts: int = Field(default=0, ge=0)
-    error: str | None = None
-    artifacts: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _terminal_states_are_complete(self) -> "StageRecord":
-        if self.status in {StageStatus.SUCCEEDED, StageStatus.FAILED} and self.finished_at is None:
-            raise ValueError(f"stage {self.stage.value}: terminal status requires finished_at")
-        if self.status is StageStatus.FAILED and not self.error:
-            raise ValueError(f"stage {self.stage.value}: failed status requires an error")
-        return self
-
-
-class RunManifest(BaseModel):
-    """Environment, fingerprints, seeds, parent/child relations and stage state."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: str = SCHEMA_VERSION
-    run_id: str
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
-    parent_run_id: str | None = None
-    spec: ExperimentSpec
-    config_fingerprint: str
-    model_fingerprint: str | None = None
-    data_fingerprint: str | None = None
-    environment: CapabilityReport | None = None
-    seed: int = 0
-    stages: dict[StageName, StageRecord] = Field(default_factory=dict)
-    notes: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _all_stages_present(self) -> "RunManifest":
-        for stage in STAGE_ORDER:
-            self.stages.setdefault(stage, StageRecord(stage=stage))
-        return self
-
-    def stage(self, stage: StageName) -> StageRecord:
-        return self.stages[stage]
-
-    def mark_running(self, stage: StageName) -> StageRecord:
-        record = self.stages[stage]
-        record.status = StageStatus.RUNNING
-        record.started_at = _utcnow()
-        record.finished_at = None
-        record.error = None
-        record.attempts += 1
-        self.updated_at = _utcnow()
-        return record
-
-    def mark_succeeded(self, stage: StageName, artifacts: list[str] | None = None) -> StageRecord:
-        record = self.stages[stage]
-        record.status = StageStatus.SUCCEEDED
-        record.finished_at = _utcnow()
-        record.error = None
-        if artifacts:
-            record.artifacts = list(artifacts)
-        self.updated_at = _utcnow()
-        return record
-
-    def mark_failed(self, stage: StageName, error: str) -> StageRecord:
-        record = self.stages[stage]
-        record.status = StageStatus.FAILED
-        record.finished_at = _utcnow()
-        record.error = error
-        self.updated_at = _utcnow()
-        return record
-
-    def last_succeeded_stage(self) -> StageName | None:
-        """Highest stage that genuinely succeeded; drives `resume`."""
-        last: StageName | None = None
-        for stage in STAGE_ORDER:
-            if self.stages[stage].status is StageStatus.SUCCEEDED:
-                last = stage
-            else:
-                break
-        return last
-
-    def next_pending_stage(self) -> StageName | None:
-        for stage in STAGE_ORDER:
-            if self.stages[stage].status is not StageStatus.SUCCEEDED:
-                return stage
-        return None
