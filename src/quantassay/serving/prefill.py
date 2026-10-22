@@ -10,6 +10,39 @@ from typing import Any
 MARKER = "QUANTASSAY_PREFILL_EVENT "
 
 
+def collect_eviction_evidence(result, log_path, output_dir):
+    from quantassay.serving.scheduling import append_jsonl, distribution
+    marker = "QUANTASSAY_KV_EVICTION "
+    events = []
+    invalid = 0
+    for number, line in enumerate(log_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if marker not in line:
+            continue
+        try:
+            event = json.loads(line.split(marker, 1)[1])
+            aligned = event["clock_id"] == result["clock_id"]
+            elapsed = event["server_monotonic_seconds"] - result["origin_monotonic_seconds"] if aligned else None
+            event.update(server_log_line=number, elapsed_seconds=elapsed,
+                         timed_workload=elapsed is not None and 0 <= elapsed <= result["wall_seconds"])
+            append_jsonl(output_dir / "kv-evictions.jsonl", event)
+            if event["timed_workload"]:
+                events.append(event)
+        except (ValueError, KeyError, TypeError):
+            invalid += 1
+    decisions = [d for e in events for d in e["decisions"]]
+    return {"status": "incomplete" if invalid else "ok" if events else "unavailable",
+            "invalid_events": invalid, "eviction_calls": len(events),
+            "victims": len(decisions),
+            "actual_freed_tokens": sum(e["actual_freed_tokens"] for e in events),
+            "queue_visible_calls": sum(bool(e["queue_request_ids"]) for e in events),
+            "changed_victims_vs_lru": sum(d["different_from_lru"] for d in decisions),
+            "estimated_extra_rounds": sum(d["estimated_extra_rounds"] for d in decisions),
+            "extra_uncached_tokens": sum(d["extra_uncached_tokens"] for d in decisions),
+            "host_eviction_ms": distribution([e["host_eviction_ms"] for e in events]),
+            "host_eviction_ms_total": sum(e["host_eviction_ms"] for e in events),
+            "scope": "estimated chunk costs are snapshot proxies, not counterfactual measured savings"}
+
+
 def collect_prefill_evidence(result: dict[str, Any], rows: list[dict[str, Any]],
                              log_path: Path, output_dir: Path) -> dict[str, Any]:
     from quantassay.serving.scheduling import append_jsonl, distribution

@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--request-rate", type=float, default=16)
     parser.add_argument("--phase-rates", type=float, nargs=3, default=(1, 12, 1),
                         help="three arrival rates for equal-sized phased request cohorts")
-    parser.add_argument("--prefix-profile", choices=("mixed", "unique"), default="mixed")
+    parser.add_argument("--prefix-profile", choices=("mixed", "unique", "cache-pressure"), default="mixed")
     parser.add_argument("--short-input-tokens", type=int, default=64)
     parser.add_argument("--long-input-tokens", type=int, default=320)
     parser.add_argument("--output-budgets", type=int, nargs="+", default=(32, 64, 96))
@@ -113,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trace-prefill-budgets", action="store_true",
                         help="requires the instrumented external engine source")
     parser.add_argument("--warmup-requests", type=int, default=3)
+    parser.add_argument("--kv-eviction-mode", choices=("native", "prefill-rounds"), default="native")
+    parser.add_argument("--trace-kv-evictions", action="store_true")
+    parser.add_argument("--kv-eviction-candidates", type=int, default=32)
+    parser.add_argument("--kv-eviction-lookahead", type=int, default=16)
+    parser.add_argument("--max-total-tokens", type=int,
+                        help="explicit KV token capacity for controlled cache-pressure studies")
     parser.add_argument("--warmup-concurrency", type=int, default=1)
     parser.add_argument("--warmup-output-tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
@@ -123,6 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trace-file", type=Path,
                         help="replay a saved workload.json; overrides generation count/rate/mode/seed")
     args = parser.parse_args(argv)
+    if args.kv_eviction_mode != "native" or args.trace_kv_evictions:
+        if not args.engine_source or not (args.engine_source / "sglang/srt/mem_cache/round_eviction.py").is_file():
+            parser.error("KV eviction experiments require the round-eviction engine source")
+        if args.adaptive_prefill or not args.chunked_prefill_size:
+            parser.error("KV eviction experiments require a fixed positive chunk budget")
     if not math.isfinite(args.aging_threshold_ms) or args.aging_threshold_ms <= 0:
         parser.error("aging threshold must be finite and positive")
     if args.policy == "lpm-aging" and not args.engine_source:
@@ -214,6 +225,14 @@ def main(argv: list[str] | None = None) -> int:
                         "--adaptive-prefill-mid-tokens", str(args.adaptive_prefill_mid_tokens)]
         if args.trace_prefill_budgets:
             command += ["--trace-prefill-budgets"]
+        if args.max_total_tokens is not None:
+            command += ["--max-total-tokens", str(args.max_total_tokens)]
+        if args.kv_eviction_mode != "native" or args.trace_kv_evictions:
+            command += ["--kv-eviction-mode", args.kv_eviction_mode,
+                        "--kv-eviction-candidates", str(args.kv_eviction_candidates),
+                        "--kv-eviction-lookahead", str(args.kv_eviction_lookahead)]
+        if args.trace_kv_evictions:
+            command += ["--trace-kv-evictions"]
         config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
                   if key not in ("run_dir", "model_dir", "trace_file")}
         manifest = {
@@ -312,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
                                 and result["metrics"]["valid_samples"] > 0)
         if args.trace_prefill_budgets:
             observation_complete = observation_complete and result["prefill_observation"]["status"] == "ok"
+        if args.trace_kv_evictions:
+            observation_complete = observation_complete and result["kv_eviction"]["status"] == "ok"
         atomic_write_json(status_path, {"status": result["status"], "policy": args.policy,
                                         "fingerprint": manifest["fingerprint"],
                                         "observation_status": "complete" if observation_complete else "incomplete",

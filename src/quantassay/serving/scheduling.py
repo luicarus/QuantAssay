@@ -47,7 +47,7 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
                 phase_rates: tuple[float, ...] = (1, 12, 1),
                 ignore_eos: bool = False) -> dict[str, Any]:
     """Materialize token inputs and open-loop arrivals before starting a server."""
-    if prefix_profile not in ("mixed", "unique"):
+    if prefix_profile not in ("mixed", "unique", "cache-pressure"):
         raise ValueError("prefix profile must be mixed or unique")
     if not 0 < short_input_tokens <= long_input_tokens or not output_budgets or min(output_budgets) < 1:
         raise ValueError("input lengths and output budgets must be positive")
@@ -71,7 +71,9 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
     )
     requests = []
     for i, offset in enumerate(offsets):
-        if prefix_profile == "unique":
+        if prefix_profile == "cache-pressure":
+            group = "shared-long"
+        elif prefix_profile == "unique":
             group = "unique-long" if i % 2 == 0 else "unique-short"
         else:
             group = "unique-long" if i % 5 == 0 else (
@@ -82,6 +84,10 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
         identity = "shared handbook" if group == "shared-long" else (
             f"private case {rng.getrandbits(128):032x}"
         )
+        if prefix_profile == "cache-pressure":
+            family = (i * 5 + i // 16) % 8
+            identity = f"document family {family} reference {random.Random(seed + family).getrandbits(128):032x}"
+            target = long_input_tokens - (family % 4) * 32
         prefix = (f"Context for {identity}. "
                   "A service accepts requests, caches intermediate states, "
                   "and must balance waiting time with efficient execution. ")
@@ -441,6 +447,8 @@ def finalize_result(result: dict[str, Any], log_path: Path, output_dir: Path) ->
     result["groups"] = groups
     from quantassay.serving.prefill import collect_prefill_evidence
     result["prefill_observation"] = collect_prefill_evidence(result, rows, log_path, output_dir)
+    from quantassay.serving.prefill import collect_eviction_evidence
+    result["kv_eviction"] = collect_eviction_evidence(result, log_path, output_dir)
     result["phases"] = {}
     for phase in result.get("arrival_phases", []):
         selected = [r for r in rows if r.get("arrival_phase") == phase["name"]]
