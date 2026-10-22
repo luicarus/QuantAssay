@@ -48,7 +48,7 @@ def build_trace(tokenizer: Any, *, count: int, mode: str, rate: float,
                 ignore_eos: bool = False) -> dict[str, Any]:
     """Materialize token inputs and open-loop arrivals before starting a server."""
     if prefix_profile not in ("mixed", "unique", "cache-pressure"):
-        raise ValueError("prefix profile must be mixed or unique")
+        raise ValueError("prefix profile must be mixed, unique, or cache-pressure")
     if not 0 < short_input_tokens <= long_input_tokens or not output_budgets or min(output_budgets) < 1:
         raise ValueError("input lengths and output budgets must be positive")
     phases = []

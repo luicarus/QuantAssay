@@ -643,3 +643,48 @@ python -m quantassay.scheduling "${common[@]}" --trace-file "$trace" \
 证据标识：`prefill-fixed128-20261009-b2`、`prefill-fixed512-20261009-b`、`prefill-adaptive-20261009-b`。固定 128 的原 b run 在执行中骤降并出现 26 次超时，作为诊断样本保留，排除整份 run 后同配置重跑为 b2；不是删除慢请求后重算。首轮 a 允许 EOS 提前结束，协议不同，不与 b 混合统计。动态 b 与固定 128 b2 仍各有约半秒的早期离散，根因未定位；每个统一协议只有一次有效独立对照，尚不能形成稳定性能结论。
 
 本次原生阻挡主要来自请求槽，没有观察到 KV 预算阻挡。free 接近零时仍可能有大量 evictable 缓存；本轮未修改 allocator、eviction 或取消/超时回收逻辑。
+
+### Prefill 轮次感知的 KV 淘汰
+
+独立实验分支 `codex/quantassay-kv-prefill-rounds-v0.5.3` 增加 `--kv-eviction-mode prefill-rounds`。
+它在等待队列可见的范围内，估计淘汰一个缓存叶子会增加多少请求 Prefill 分块，按每释放一个 token 的边际代价选择受害节点。默认 `native` 保留原有行为。
+
+对请求长度 L、可用缓存前缀 P、净 chunk 预算 B，用 `ceil(max(1, L-P)/B)` 估计分块数。候选按新增分块/token、新增未命中 token/token、LRU 顺序比较。每次淘汰后更新前缀长度，再选择下一个节点；等待请求重复使用同一前缀时，代理成本可能高估真实累计重算。
+
+目前支持普通 Python RadixCache、LRU、固定正 chunk、非 speculative、PP=1 普通服务。候选必须是未锁定的可回收叶子；原生节点释放、父节点处理和分配约束保留。算法不压缩正在执行请求的 Attention KV，也不把 KV 搬到 CPU。
+
+参数与默认值：`--kv-eviction-candidates 32`（最旧的可回收候选）、`--kv-eviction-lookahead 16`（前几个等待请求）、`--trace-kv-evictions`（默认关闭）。匹配需求时不刷新 LRU、不分裂节点、不读取 CUDA 张量内容。无队列需求或无可用净预算时退回 LRU。
+
+容量受控的对照示例，`$ENGINE` 指向该分支的 `python/`：
+
+```bash
+common=(--model-dir "$SNAP" --revision "$REV" --engine-source "$ENGINE"
+  --policy fcfs --context-length 1024 --max-running-requests 2 --cuda-graph-max-bs 2
+  --max-total-tokens 2048 --chunked-prefill-size 128
+  --prefix-profile cache-pressure --long-input-tokens 512
+  --output-budgets 64 --ignore-eos --requests 80 --arrival-mode fixed --request-rate 8
+  --warmup-requests 8 --warmup-concurrency 2 --warmup-output-tokens 64
+  --trace-prefill-budgets --trace-kv-evictions)
+
+python -m quantassay.scheduling "${common[@]}" --kv-eviction-mode native \
+  --run-dir "$HOME/quantassay-runs/kv-native-01"
+python -m quantassay.scheduling "${common[@]}" --kv-eviction-mode prefill-rounds \
+  --trace-file "$HOME/quantassay-runs/kv-native-01/workload.json" \
+  --run-dir "$HOME/quantassay-runs/kv-rounds-01"
+```
+
+`cache-pressure` 生成 8 个重复前缀族，输入长度目标为长输入参数减去 0/32/64/96 token；具体 token ID 和实际长度保存在 workload。`--max-total-tokens` 默认不指定；例中 2048 是主动限制的 KV token 容量，不代表显卡默认容量。两侧排序策略须相同；换为 LPM 时，也要成对比较。
+
+`kv-evictions.jsonl` 保存原生实际释放的索引数量、allocator 空闲量前后差值、候选选择、快照成本和主机侧回收耗时。汇总见 `scheduling-result.json` 的 `kv_eviction`。估算分块数不等于 GPU batch 次数，局部 LRU 候选的估计也不构成实测反事实收益。观测基线同样计算候选成本，因此两侧 CPU 差值不代表相对完全无仪表原生路径的全部开销。
+
+2026-10-22 初步服务结果：六个 run 各 80/80 成功、输出 5120 token。同一对照内模型、源码、控制器、trace 和其余实际服务参数一致，所有计时回收事件的释放数量与 allocator 空闲量增量一致。
+
+| 场景 / 顺序 | 缓存命中 token，原生 → 算法 | 实际请求 Prefill 分块数 | 输出 tok/s |
+|---|---:|---:|---:|
+| LPM，原生先跑 | 31860 → 31860 | 104 → 104 | 214.118 → 214.789 |
+| FCFS，原生先跑 | 5859 → 12663 | 284 → 228 | 179.080 → 184.844 |
+| FCFS，算法先跑 | 5859 → 12382 | 284 → 231 | 176.279 → 180.699 |
+
+LPM 对照中没有改变淘汰选择，没有证明额外收益。FCFS 两组分别改变 259/257 次受害节点选择，实际请求分块数降低 19.7%/18.7%，吞吐增加 3.2%/2.5%。这些是特定合成负载、主动限制 KV 容量的初步结果，只有两次 FCFS 独立对照，保持默认关闭。证据标识 `kv-rounds-{native,policy}-20261022-{a,b,c}`。
+
+尾延迟并未一致改善；算法 c 的最大 ITL 为 558.885 ms，原始慢样本完整保留。性能结论也未覆盖完全无仪表基线或其他模型、硬件与负载。

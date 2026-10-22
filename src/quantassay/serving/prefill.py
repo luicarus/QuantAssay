@@ -109,5 +109,5 @@ def collect_prefill_evidence(result: dict[str, Any], rows: list[dict[str, Any]],
         "kv_token_ranges": {k: {"min": min(v), "max": max(v)} for k, v in kv.items()},
         "phases": phases,
         "scope": "host prepared batches; repeated identical block states suppressed; event counts are not request counts",
-        "eviction_count": {"status": "unavailable", "reason": "allocator eviction is not instrumented"},
+        "eviction_count": {"status": "unavailable", "reason": "not collected by prefill events; see kv_eviction for direct eviction observations"},
     }
